@@ -84,6 +84,8 @@ export default function GameBoard() {
   const [setupPieceId, setSetupPieceId] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [revealAll, setRevealAll] = useState(false);
+  const [showGameOverModal, setShowGameOverModal] = useState(false);
   const aiThinking = useRef(false);
 
   const theme = THEMES[themeId];
@@ -117,6 +119,15 @@ export default function GameBoard() {
     return () => { clearTimeout(t); aiThinking.current = false; };
   }, [gameState, mode, playerSide, sounds]);
 
+  // ── Reveal enemy pieces on game over, delay modal by 5 s ──
+  useEffect(() => {
+    if (gameState.phase === GamePhase.GameOver) {
+      setRevealAll(true);
+      const t = setTimeout(() => setShowGameOverModal(true), 5000);
+      return () => clearTimeout(t);
+    }
+  }, [gameState.phase]);
+
   const startVsAI = useCallback(() => {
     let state = createInitialGameState();
     state = { ...state, pieces: generateRandomSetup(state.pieces, Player.Black) };
@@ -125,6 +136,8 @@ export default function GameBoard() {
     setSelectedPieceId(null);
     setValidMoves([]);
     setLastMove(null);
+    setRevealAll(false);
+    setShowGameOverModal(false);
     sounds?.click();
   }, [sounds]);
 
@@ -245,6 +258,8 @@ export default function GameBoard() {
     setLastMove(null);
     setChallengeAnim(null);
     setSetupPieceId(null);
+    setRevealAll(false);
+    setShowGameOverModal(false);
   }, []);
 
   // ── Square background ──
@@ -260,13 +275,14 @@ export default function GameBoard() {
   }
 
   // ── Render piece with icon cropping (background-image approach) ──
-  function renderPiece(piece: Piece, size: 'normal' | 'small' | 'tray' = 'normal') {
+  function renderPiece(piece: Piece, size: 'normal' | 'small' | 'tray' = 'normal', revealDelay?: number) {
     const isOwn = piece.owner === playerSide;
     const bg = isOwn ? theme.whitePieceBg : theme.blackPieceBg;
     const text = isOwn ? theme.whitePieceText : theme.blackPieceText;
     const border = isOwn ? theme.whitePieceBorder : theme.blackPieceBorder;
     const isSelected = piece.id === selectedPieceId || piece.id === setupPieceId;
-    const canSee = isOwn;
+    const canSee = isOwn || revealAll;
+    const isRevealing = revealAll && !isOwn;
     const sideClass = isOwn ? 'side-white' : 'side-black';
 
     let sizeClass = 'piece';
@@ -276,7 +292,8 @@ export default function GameBoard() {
 
     return (
       <div
-        className={`${sizeClass} ${bg} ${border} border rounded-sm flex items-center justify-center overflow-hidden ${isSelected ? 'piece-selected ring-2 ring-[#c8a951]' : ''} transition-all duration-150 select-none`}
+        className={`${sizeClass} ${bg} ${border} border rounded-sm flex items-center justify-center overflow-hidden ${isSelected ? 'piece-selected ring-2 ring-[#c8a951]' : ''} ${isRevealing ? 'animate-piece-reveal' : 'transition-all duration-150'} select-none`}
+        style={isRevealing && revealDelay != null ? { animationDelay: `${revealDelay}ms` } : undefined}
         title={canSee ? RANK_DISPLAY_NAME[piece.rank] : undefined}
       >
         {canSee ? (
@@ -300,19 +317,21 @@ export default function GameBoard() {
     const colLabels = playerSide === Player.White ? COLUMN_LABELS : [...COLUMN_LABELS].reverse();
 
     return (
-      <div className={`${theme.boardBorder} border-2 rounded-lg overflow-hidden shadow-2xl`}>
+      <div className={`${theme.boardBorder} border-2 rounded-lg overflow-hidden shadow-2xl relative`}>
+        {/* Board overlay pattern */}
+        {theme.boardOverlayStyle && <div className={`absolute inset-0 pointer-events-none z-10 ${theme.boardOverlayOpacity ?? 'opacity-[0.25]'}`} style={theme.boardOverlayStyle} />}
         {/* Top column labels */}
         <div className="flex">
-          <div className="label-cell" />
+          <div className="label-corner" />
           {colLabels.map((l) => (
-            <div key={l} className={`label-cell-top flex items-center justify-center ${theme.labelColor} text-[10px] font-mono`} style={{ width: 'var(--sq-size)' }}>{l}</div>
+            <div key={l} className={`label-cell-top flex items-center justify-center ${theme.labelColor} text-[10px] sm:text-xs md:text-sm font-mono`} style={{ width: 'var(--sq-size)' }}>{l}</div>
           ))}
         </div>
         {Array.from({ length: BOARD_ROWS }).map((_, vr) => {
           const lr = logicalRowFromVisual(vr, playerSide);
           return (
             <div key={vr} className="flex">
-              <div className={`label-cell flex items-center justify-center ${theme.labelColor} text-[10px] font-mono`}>{lr + 1}</div>
+              <div className={`label-cell flex items-center justify-center ${theme.labelColor} text-[10px] sm:text-xs md:text-sm font-mono`}>{lr + 1}</div>
               {Array.from({ length: BOARD_COLS }).map((_, vc) => {
                 const lc = playerSide === Player.White ? vc : BOARD_COLS - 1 - vc;
                 const piece = getPieceAtPosition(gameState.pieces, { row: lr, col: lc });
@@ -337,7 +356,7 @@ export default function GameBoard() {
                         draggable={isSetup && piece.owner === playerSide}
                         onDragStart={isSetup && piece.owner === playerSide ? (e) => handleDragStart(e, piece.id) : undefined}
                       >
-                        {renderPiece(piece)}
+                        {renderPiece(piece, 'normal', piece.position ? (piece.position.row * BOARD_COLS + piece.position.col) * 40 : 0)}
                       </div>
                     )}
                     {!isSetup && isValid && !piece && <div className={`w-3 h-3 rounded-full ${theme.validMoveDot}`} />}
@@ -468,6 +487,7 @@ export default function GameBoard() {
 
     return (
       <div className={`min-h-screen ${theme.pageBg} flex flex-col`}>
+        {theme.pageOverlayStyle && <div className={`fixed inset-0 pointer-events-none ${theme.pageOverlayOpacity ?? 'opacity-[0.06]'}`} style={theme.pageOverlayStyle} />}
         <Header theme={theme} onBack={handleNewGame} />
         <div className="flex-1 flex flex-col lg:flex-row items-center justify-center gap-4 lg:gap-6 px-2 py-4">
           <div className="animate-fade-in">{renderBoard(true)}</div>
@@ -509,6 +529,7 @@ export default function GameBoard() {
 
   return (
     <div className={`min-h-screen ${theme.pageBg} flex flex-col`}>
+      {theme.pageOverlayStyle && <div className={`fixed inset-0 pointer-events-none ${theme.pageOverlayOpacity ?? 'opacity-[0.06]'}`} style={theme.pageOverlayStyle} />}
       <Header theme={theme} onBack={handleNewGame} showSettings={() => setShowSettings(!showSettings)} />
       {showSettings && (
         <div className={`${theme.panelBg} ${theme.panelBorder} border mx-auto w-72 rounded-xl p-4 animate-slide-down mb-2`}>
@@ -547,6 +568,11 @@ export default function GameBoard() {
               {isMyTurn ? 'Your Turn' : 'Opponent Thinking…'}
             </div>
           )}
+          {revealAll && !showGameOverModal && (
+            <div className="flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-bold bg-[#c8a951] text-[#0a0f1a] shadow-lg shadow-[#c8a951]/30 animate-pulse-glow">
+              ⚔️ Revealing Enemy Forces…
+            </div>
+          )}
           <div className="flex items-center gap-1 text-[10px] animate-arbiter-glow"><span>⚖️</span><span className={theme.panelTextMuted}>Arbiter</span></div>
           {renderBoard(false)}
           <p className={`${theme.panelTextMuted} text-[10px]`}>Turn {Math.ceil(gameState.turnCount / 2) + 1}</p>
@@ -577,8 +603,8 @@ export default function GameBoard() {
         </div>
       </div>
 
-      {/* Game over overlay */}
-      {gameState.phase === GamePhase.GameOver && (
+      {/* Game over overlay — delayed 5 s to let reveal animation play */}
+      {gameState.phase === GamePhase.GameOver && showGameOverModal && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 animate-fade-in">
           <div className={`${theme.panelBg} ${theme.panelBorder} border rounded-2xl p-8 max-w-sm w-full mx-4 text-center animate-bounce-in`}>
             <div className="text-5xl mb-4">{gameState.winner === playerSide ? '🏆' : '💀'}</div>
@@ -600,29 +626,33 @@ export default function GameBoard() {
 
 function Header({ theme, onBack, showSettings }: { theme: BoardTheme; onBack?: () => void; showSettings?: () => void }) {
   return (
-    <header className={`border-b ${theme.panelBorder} px-4 py-2 flex items-center justify-between`}>
-      <div className="flex items-center gap-3">
+    <header className={`border-b ${theme.panelBorder} px-4 sm:px-6 py-3 sm:py-4 flex items-center justify-between`}>
+      <div className="flex items-center gap-4">
         {onBack ? (
-          <button onClick={onBack} className={`${theme.panelTextMuted} text-xs flex items-center gap-1`}><svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg>Menu</button>
+          <button onClick={onBack} className={`${theme.panelTextMuted} hover:text-[#c8a951] transition-colors text-sm sm:text-base font-medium flex items-center gap-1.5`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg>Menu</button>
         ) : (
-          <Link href="/" className={`${theme.panelTextMuted} text-xs flex items-center gap-1`}><svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg>Home</Link>
+          <Link href="/" className={`${theme.panelTextMuted} hover:text-[#c8a951] transition-colors text-sm sm:text-base font-medium flex items-center gap-1.5`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg>Home</Link>
         )}
-        <h1 className={`${theme.headerColor} font-display text-sm md:text-base`}>Game of the Generals</h1>
+        <h1 className={`${theme.headerColor} font-display text-base sm:text-lg md:text-xl`}>Game of the Generals</h1>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-3">
         {showSettings && (
-          <button onClick={showSettings} className={`${theme.panelTextMuted} p-1 rounded-lg`}>
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+          <button onClick={showSettings} className={`${theme.panelTextMuted} hover:text-[#c8a951] transition-colors p-1.5 rounded-lg`}>
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
           </button>
         )}
-        <Link href="/rules" className={`${theme.panelTextMuted} text-xs`}>Rules</Link>
+        <Link href="/rules" className={`${theme.panelTextMuted} hover:text-[#c8a951] transition-colors text-sm sm:text-base font-medium`}>Rules</Link>
       </div>
     </header>
   );
 }
 
 function Foot({ theme }: { theme: BoardTheme }) {
-  return <footer className={`border-t ${theme.panelBorder} px-4 py-1.5 text-center`}><p className={`${theme.panelTextMuted} text-[10px]`}>Game of the Generals — Salpakan</p></footer>;
+  return (
+    <footer className={`border-t ${theme.panelBorder} px-4 sm:px-6 py-2.5 sm:py-3 text-center`}>
+      <p className={`${theme.panelTextMuted} text-xs sm:text-sm font-medium tracking-wide`}>Game of the Generals — Salpakan</p>
+    </footer>
+  );
 }
 
 function Toggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {

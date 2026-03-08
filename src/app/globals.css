@@ -5,9 +5,19 @@
   --foreground: #d0dae8;
   --gold: #c8a951;
   --navy: #0d1520;
-  --sq-size: 44px;
-  --piece-w: 36px;
-  --piece-h: 28px;
+  --sq-size: 36px;
+  --piece-w: 28px;
+  --piece-h: 22px;
+  --label-size: 16px;
+}
+
+@media (min-width: 420px) {
+  :root {
+    --sq-size: 42px;
+    --piece-w: 34px;
+    --piece-h: 26px;
+    --label-size: 18px;
+  }
 }
 
 @media (min-width: 768px) {
@@ -15,14 +25,25 @@
     --sq-size: 60px;
     --piece-w: 50px;
     --piece-h: 38px;
+    --label-size: 22px;
   }
 }
 
 @media (min-width: 1024px) {
   :root {
-    --sq-size: 74px;
-    --piece-w: 62px;
+    --sq-size: 76px;
+    --piece-w: 64px;
     --piece-h: 48px;
+    --label-size: 26px;
+  }
+}
+
+@media (min-width: 1440px) {
+  :root {
+    --sq-size: 88px;
+    --piece-w: 74px;
+    --piece-h: 56px;
+    --label-size: 30px;
   }
 }
 
@@ -56,21 +77,22 @@ body {
   height: var(--sq-size);
 }
 
-/* Row/column labels — narrower than squares */
+/* Row/column labels — symmetric spacing from board */
 .label-cell {
-  width: 20px;
+  width: var(--label-size);
   height: var(--sq-size);
   flex-shrink: 0;
 }
 .label-cell-top {
   width: var(--sq-size);
-  height: 18px;
+  height: var(--label-size);
   flex-shrink: 0;
 }
-
-@media (min-width: 768px) {
-  .label-cell { width: 24px; }
-  .label-cell-top { height: 20px; }
+/* Corner spacer: matches label-size on both axes */
+.label-corner {
+  width: var(--label-size);
+  height: var(--label-size);
+  flex-shrink: 0;
 }
 
 /* Piece sizing - rectangular (wider than tall) */
@@ -184,6 +206,13 @@ body {
 .animate-arbiter-glow { animation: arbiter-glow 2s ease-in-out infinite; }
 .animate-piece-place { animation: piece-place 0.25s ease-out; }
 .animate-slide-down { animation: slide-down 0.3s ease-out; }
+
+@keyframes piece-reveal {
+  0%   { transform: scale(0.5) rotateY(90deg); opacity: 0; filter: brightness(2.5); }
+  55%  { transform: scale(1.1) rotateY(-6deg); opacity: 1; filter: brightness(1.6); }
+  100% { transform: scale(1)   rotateY(0deg);  opacity: 1; filter: brightness(1); }
+}
+.animate-piece-reveal { animation: piece-reveal 0.55s ease-out both; }
 
 /* Subtle hover lift for interactive elements */
 .hover-lift {
