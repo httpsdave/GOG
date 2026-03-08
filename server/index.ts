@@ -817,6 +817,6 @@ setInterval(() => {
   }
 }, 2000);
 
-httpServer.listen(PORT, () => {
-  console.log(`Game server running on port ${PORT}`);
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Game server running on 0.0.0.0:${PORT}`);
 });

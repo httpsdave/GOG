@@ -72,9 +72,9 @@ export default function SignupPage() {
     setLoading(true);
     try {
       await signInWithGoogle();
-      router.replace('/play');
+      // onAuthStateChanged will fire and useEffect will redirect to /play
     } catch {
-      setError('Google sign-in failed');
+      // errors are surfaced via authError from AuthProvider
     } finally {
       setLoading(false);
     }

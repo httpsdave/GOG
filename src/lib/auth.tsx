@@ -4,8 +4,7 @@ import { createContext, useContext, useEffect, useState, ReactNode } from 'react
 import {
   User,
   onAuthStateChanged,
-  signInWithRedirect,
-  getRedirectResult,
+  signInWithPopup,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   sendEmailVerification,
@@ -96,26 +95,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   useEffect(() => {
-    // Handle redirect result from Google sign-in on return from Google's OAuth page
-    getRedirectResult(auth)
-      .then(async (result) => {
-        if (result?.user) {
-          setAuthError(null);
-          try {
-            await ensureUserProfile(result.user);
-          } catch (err: unknown) {
-            const e = err as { message?: string };
-            setAuthError(e.message ? `Signed in, but profile setup failed: ${e.message}` : 'Signed in, but profile setup failed');
-          }
-        }
-      })
-      .catch((err: unknown) => {
-        if (!handleMfaError(err)) {
-          const e = err as { code?: string; message?: string };
-          setAuthError(e.code ? `${e.code}: ${e.message || ''}`.trim() : 'Google sign-in redirect failed');
-        }
-      });
-
     const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
@@ -140,8 +119,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signInWithGoogle = async () => {
     setAuthError(null);
-    await signInWithRedirect(auth, googleProvider);
-    // Page will navigate away; result is handled in useEffect via getRedirectResult
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err: unknown) {
+      if (!handleMfaError(err)) {
+        const e = err as { code?: string; message?: string };
+        setAuthError(e.code ? `${e.code}: ${e.message || ''}`.trim() : 'Google sign-in failed');
+      }
+    }
   };
 
   const signInWithEmail = async (email: string, password: string) => {

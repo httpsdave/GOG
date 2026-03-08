@@ -47,10 +47,14 @@ export default function LoginPage() {
   const handleGoogleLogin = async () => {
     setError('');
     setLoading(true);
-    // signInWithRedirect navigates the page away to Google;
-    // on return, getRedirectResult in AuthProvider handles the result
-    // and onAuthStateChanged will fire, which redirects to /play via the user check above.
-    await signInWithGoogle();
+    try {
+      await signInWithGoogle();
+      // onAuthStateChanged will fire and useEffect will redirect to /play
+    } catch {
+      // errors are surfaced via authError from AuthProvider
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleMfa = async (e: React.FormEvent) => {
