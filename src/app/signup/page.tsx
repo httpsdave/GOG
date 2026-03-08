@@ -1,12 +1,12 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 
 export default function SignupPage() {
-  const { user, signUpWithEmail, signInWithGoogle } = useAuth();
+  const { user, loading: authLoading, signUpWithEmail, signInWithGoogle } = useAuth();
   const router = useRouter();
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
@@ -16,9 +16,18 @@ export default function SignupPage() {
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
 
-  if (user) {
-    router.push('/play');
-    return null;
+  useEffect(() => {
+    if (user) {
+      router.push('/play');
+    }
+  }, [user, router]);
+
+  if (authLoading || user) {
+    return (
+      <div className="min-h-screen bg-[#080c14] flex items-center justify-center">
+        <div className="text-[#c8a951] text-lg animate-pulse">Loading...</div>
+      </div>
+    );
   }
 
   const handleSignup = async (e: React.FormEvent) => {

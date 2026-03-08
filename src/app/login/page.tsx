@@ -1,12 +1,12 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 
 export default function LoginPage() {
-  const { user, signInWithGoogle, signInWithEmail, mfaResolver, resolveMfa, mfaError, authError } = useAuth();
+  const { user, loading: authLoading, signInWithGoogle, signInWithEmail, mfaResolver, resolveMfa, mfaError, authError } = useAuth();
   const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -14,9 +14,18 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  if (user) {
-    router.push('/play');
-    return null;
+  useEffect(() => {
+    if (user) {
+      router.push('/play');
+    }
+  }, [user, router]);
+
+  if (authLoading || user) {
+    return (
+      <div className="min-h-screen bg-[#080c14] flex items-center justify-center">
+        <div className="text-[#c8a951] text-lg animate-pulse">Loading...</div>
+      </div>
+    );
   }
 
   const handleEmailLogin = async (e: React.FormEvent) => {
