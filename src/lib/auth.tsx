@@ -4,7 +4,8 @@ import { createContext, useContext, useEffect, useState, ReactNode } from 'react
 import {
   User,
   onAuthStateChanged,
-  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   sendEmailVerification,
@@ -81,20 +82,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [mfaResolver, setMfaResolver] = useState<MultiFactorResolver | null>(null);
   const [mfaError, setMfaError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (u) => {
-      setUser(u);
-      if (u) {
-        const p = await ensureUserProfile(u);
-        setProfile(p);
-      } else {
-        setProfile(null);
-      }
-      setLoading(false);
-    });
-    return unsub;
-  }, []);
-
   const handleMfaError = (err: unknown) => {
     const error = err as MultiFactorError;
     if (error.code === 'auth/multi-factor-auth-required') {
@@ -106,13 +93,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return false;
   };
 
+  useEffect(() => {
+    // Handle redirect result from Google sign-in on return from Google's OAuth page
+    getRedirectResult(auth).then(async (result) => {
+      if (result?.user) {
+        await ensureUserProfile(result.user);
+      }
+    }).catch((err: unknown) => {
+      handleMfaError(err);
+    });
+
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      if (u) {
+        const p = await ensureUserProfile(u);
+        setProfile(p);
+      } else {
+        setProfile(null);
+      }
+      setLoading(false);
+    });
+    return unsub;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const signInWithGoogle = async () => {
-    try {
-      const result = await signInWithPopup(auth, googleProvider);
-      await ensureUserProfile(result.user);
-    } catch (err) {
-      if (!handleMfaError(err)) throw err;
-    }
+    await signInWithRedirect(auth, googleProvider);
+    // Page will navigate away; result is handled in useEffect via getRedirectResult
   };
 
   const signInWithEmail = async (email: string, password: string) => {

@@ -38,16 +38,10 @@ export default function LoginPage() {
   const handleGoogleLogin = async () => {
     setError('');
     setLoading(true);
-    try {
-      await signInWithGoogle();
-      router.push('/play');
-    } catch (err: unknown) {
-      const firebaseErr = err as { code?: string };
-      if (firebaseErr.code === 'auth/multi-factor-auth-required') return;
-      setError('Google sign-in failed');
-    } finally {
-      setLoading(false);
-    }
+    // signInWithRedirect navigates the page away to Google;
+    // on return, getRedirectResult in AuthProvider handles the result
+    // and onAuthStateChanged will fire, which redirects to /play via the user check above.
+    await signInWithGoogle();
   };
 
   const handleMfa = async (e: React.FormEvent) => {
