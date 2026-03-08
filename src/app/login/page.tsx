@@ -16,7 +16,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (user) {
-      router.push('/play');
+      router.replace('/play');
     }
   }, [user, router]);
 
@@ -34,7 +34,7 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await signInWithEmail(email, password);
-      router.push('/play');
+      router.replace('/play');
     } catch (err: unknown) {
       const firebaseErr = err as { code?: string };
       if (firebaseErr.code === 'auth/multi-factor-auth-required') return;
@@ -59,7 +59,7 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await resolveMfa(mfaResolver, mfaCode);
-      router.push('/play');
+      router.replace('/play');
     } catch {
       setError('Invalid 2FA code');
     } finally {

@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 
 export default function SignupPage() {
-  const { user, loading: authLoading, signUpWithEmail, signInWithGoogle } = useAuth();
+  const { user, loading: authLoading, signUpWithEmail, signInWithGoogle, authError } = useAuth();
   const router = useRouter();
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
@@ -18,7 +18,7 @@ export default function SignupPage() {
 
   useEffect(() => {
     if (user) {
-      router.push('/play');
+      router.replace('/play');
     }
   }, [user, router]);
 
@@ -72,7 +72,7 @@ export default function SignupPage() {
     setLoading(true);
     try {
       await signInWithGoogle();
-      router.push('/play');
+      router.replace('/play');
     } catch {
       setError('Google sign-in failed');
     } finally {
@@ -104,6 +104,7 @@ export default function SignupPage() {
             </svg>
             Continue with Google
           </button>
+          {authError && <p className="text-red-400 text-sm">{authError}</p>}
 
           <div className="flex items-center gap-3">
             <div className="h-px flex-1 bg-[#1a2535]" />

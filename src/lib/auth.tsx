@@ -97,24 +97,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     // Handle redirect result from Google sign-in on return from Google's OAuth page
-    getRedirectResult(auth).then(async (result) => {
-      if (result?.user) {
-        setAuthError(null);
-        await ensureUserProfile(result.user);
-      }
-    }).catch((err: unknown) => {
-      if (!handleMfaError(err)) {
-        const e = err as { code?: string; message?: string };
-        setAuthError(e.code ? `${e.code}: ${e.message || ''}`.trim() : 'Google sign-in redirect failed');
-      }
-    });
+    getRedirectResult(auth)
+      .then(async (result) => {
+        if (result?.user) {
+          setAuthError(null);
+          try {
+            await ensureUserProfile(result.user);
+          } catch (err: unknown) {
+            const e = err as { message?: string };
+            setAuthError(e.message ? `Signed in, but profile setup failed: ${e.message}` : 'Signed in, but profile setup failed');
+          }
+        }
+      })
+      .catch((err: unknown) => {
+        if (!handleMfaError(err)) {
+          const e = err as { code?: string; message?: string };
+          setAuthError(e.code ? `${e.code}: ${e.message || ''}`.trim() : 'Google sign-in redirect failed');
+        }
+      });
 
     const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        setAuthError(null);
-        const p = await ensureUserProfile(u);
-        setProfile(p);
+        try {
+          setAuthError(null);
+          const p = await ensureUserProfile(u);
+          setProfile(p);
+        } catch (err: unknown) {
+          // Keep auth state usable even if Firestore profile reads/writes fail.
+          setProfile(null);
+          const e = err as { message?: string };
+          setAuthError(e.message ? `Signed in, but profile load failed: ${e.message}` : 'Signed in, but profile load failed');
+        }
       } else {
         setProfile(null);
       }
