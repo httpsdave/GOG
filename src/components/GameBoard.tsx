@@ -26,6 +26,11 @@ import {
 import { getAIMove } from '@/game/ai';
 import { THEMES, ThemeId, BoardTheme } from '@/lib/themes';
 import { getSounds } from '@/lib/sounds';
+import { useAuth } from '@/lib/auth';
+import { connectSocket, disconnectSocket } from '@/lib/socket';
+
+type TimerMode = 'none' | '30s' | '1m' | '2m';
+const TIMER_LABELS: Record<TimerMode, string> = { 'none': 'No Timer', '30s': '30 seconds', '1m': '1 minute', '2m': '2 minutes' };
 
 // ─── Icon mapping (each image is 250×76 with white side on left, black on right) ───
 const RANK_ICON: Record<Rank, string> = {
@@ -64,7 +69,7 @@ const RANK_SHORT: Record<Rank, string> = {
   [Rank.Flag]: 'FLG',
 };
 
-type GameMode = 'menu' | 'vs-ai' | 'online';
+type GameMode = 'menu' | 'vs-ai' | 'online' | 'queue' | 'custom-lobby' | 'custom-join';
 
 /* Flip board so the current player is always at the bottom */
 function logicalRowFromVisual(visualRow: number, playerSide: Player): number {
@@ -73,12 +78,13 @@ function logicalRowFromVisual(visualRow: number, playerSide: Player): number {
 }
 
 export default function GameBoard() {
+  const { user, profile, getIdToken } = useAuth();
   const [mode, setMode] = useState<GameMode>('menu');
   const [gameState, setGameState] = useState<GameState>(createInitialGameState);
   const [selectedPieceId, setSelectedPieceId] = useState<string | null>(null);
   const [validMoves, setValidMoves] = useState<Position[]>([]);
   const [themeId, setThemeId] = useState<ThemeId>('vintage');
-  const [playerSide] = useState<Player>(Player.White);
+  const [playerSide, setPlayerSide] = useState<Player>(Player.White);
   const [lastMove, setLastMove] = useState<{ from: Position; to: Position } | null>(null);
   const [challengeAnim, setChallengeAnim] = useState<Position | null>(null);
   const [setupPieceId, setSetupPieceId] = useState<string | null>(null);
@@ -88,6 +94,21 @@ export default function GameBoard() {
   const [showGameOverModal, setShowGameOverModal] = useState(false);
   const [previewThemeId, setPreviewThemeId] = useState<ThemeId | null>(null);
   const aiThinking = useRef(false);
+
+  // Online state
+  const [timerMode, setTimerMode] = useState<TimerMode>('1m');
+  const [queueTime, setQueueTime] = useState(0);
+  const [queuePlayers, setQueuePlayers] = useState(0);
+  const [lobbyCode, setLobbyCode] = useState('');
+  const [joinCode, setJoinCode] = useState('');
+  const [opponentName, setOpponentName] = useState('');
+  const [opponentElo, setOpponentElo] = useState(0);
+  const [onlineTimerWhite, setOnlineTimerWhite] = useState(0);
+  const [onlineTimerBlack, setOnlineTimerBlack] = useState(0);
+  const [onlineTimerMode, setOnlineTimerMode] = useState<TimerMode>('none');
+  const [onlineError, setOnlineError] = useState('');
+  const [eloChange, setEloChange] = useState(0);
+  const queueInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const theme = THEMES[themeId];
   const sounds = typeof window !== 'undefined' ? getSounds() : null;
@@ -128,6 +149,202 @@ export default function GameBoard() {
       return () => clearTimeout(t);
     }
   }, [gameState.phase]);
+
+  // ── Online: connect and listen for socket events ──
+  const connectOnline = useCallback(async () => {
+    if (!user) return;
+    const token = await getIdToken();
+    if (!token) return;
+    const s = connectSocket();
+
+    // Wait for authentication before proceeding
+    await new Promise<void>((resolve, reject) => {
+      s.emit('authenticate' as never, { token } as never);
+
+      s.once('authenticated' as never, ((_data: { username: string; elo: number }) => {
+        setOnlineError('');
+        resolve();
+      }) as never);
+
+      s.once('authError' as never, ((data: { message: string }) => {
+        setOnlineError(data.message);
+        reject(new Error(data.message));
+      }) as never);
+    });
+
+    s.on('queueUpdate' as never, ((data: { position: number; playersInQueue: number }) => {
+      setQueuePlayers(data.playersInQueue);
+    }) as never);
+
+    s.on('matchFound' as never, ((data: { roomId: string; color: 'white' | 'black'; opponent: string; opponentElo: number; timerMode: TimerMode }) => {
+      setPlayerSide(data.color === 'white' ? Player.White : Player.Black);
+      setOpponentName(data.opponent);
+      setOpponentElo(data.opponentElo);
+      setOnlineTimerMode(data.timerMode);
+      setMode('online');
+      if (queueInterval.current) { clearInterval(queueInterval.current); queueInterval.current = null; }
+    }) as never);
+
+    s.on('lobbyCreated' as never, ((data: { code: string }) => {
+      setLobbyCode(data.code);
+    }) as never);
+
+    s.on('roomJoined' as never, ((data: { roomId: string; color: 'white' | 'black' }) => {
+      setPlayerSide(data.color === 'white' ? Player.White : Player.Black);
+      setMode('online');
+    }) as never);
+
+    s.on('opponentJoined' as never, ((data: { opponent: string; opponentElo: number }) => {
+      setOpponentName(data.opponent);
+      setOpponentElo(data.opponentElo);
+      setMode('online');
+    }) as never);
+
+    s.on('setupPhase' as never, (() => {
+      let state = createInitialGameState();
+      setGameState(state);
+      setRevealAll(false);
+      setShowGameOverModal(false);
+    }) as never);
+
+    s.on('gameStart' as never, ((data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode }) => {
+      setOnlineTimerMode(data.timerMode);
+      setGameState(prev => ({ ...prev, phase: GamePhase.Playing, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black }));
+    }) as never);
+
+    s.on('opponentReady' as never, (() => {
+      sounds?.click();
+    }) as never);
+
+    s.on('gameOver' as never, ((data: { winner: 'white' | 'black'; reason: string; eloChange: number }) => {
+      const winner = data.winner === 'white' ? Player.White : Player.Black;
+      setGameState(prev => ({ ...prev, phase: GamePhase.GameOver, winner, winReason: data.reason }));
+      setEloChange(data.eloChange);
+      winner === playerSide ? sounds?.victory() : sounds?.defeat();
+    }) as never);
+
+    s.on('error' as never, ((data: { message: string }) => {
+      setOnlineError(data.message);
+    }) as never);
+
+    s.on('timerUpdate' as never, ((data: { white: number; black: number }) => {
+      setOnlineTimerWhite(data.white);
+      setOnlineTimerBlack(data.black);
+    }) as never);
+
+    s.on('moveMade' as never, ((data: { pieceId: string; fromRow: number; fromCol: number; toRow: number; toCol: number; challenge?: { result: string; eliminatedPieceIds: string[] }; currentPlayer: 'white' | 'black'; turnCount: number; timerWhite: number; timerBlack: number }) => {
+      const from: Position = { row: data.fromRow, col: data.fromCol };
+      const to: Position = { row: data.toRow, col: data.toCol };
+      setLastMove({ from, to });
+      if (data.challenge) {
+        setChallengeAnim(to);
+        sounds?.capture();
+        setTimeout(() => setChallengeAnim(null), 600);
+      } else {
+        sounds?.move();
+      }
+      setOnlineTimerWhite(data.timerWhite);
+      setOnlineTimerBlack(data.timerBlack);
+      setGameState(prev => {
+        let pieces = [...prev.pieces];
+        const movingPiece = pieces.find(p => p.id === data.pieceId);
+        if (!movingPiece) return prev;
+        if (data.challenge) {
+          const result = data.challenge.result;
+          if (result === 'attacker_wins' || result === 'flag_captured') {
+            const defender = getPieceAtPosition(pieces, to);
+            if (defender) {
+              pieces = pieces.map(p => {
+                if (p.id === data.pieceId) return { ...p, position: to };
+                if (p.id === defender.id) return { ...p, position: null, isAlive: false };
+                return p;
+              });
+              const elimKey = defender.owner === Player.White ? 'white' : 'black';
+              return { ...prev, pieces, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, eliminatedPieces: { ...prev.eliminatedPieces, [elimKey]: [...prev.eliminatedPieces[elimKey], defender] } };
+            }
+          } else if (result === 'defender_wins') {
+            pieces = pieces.map(p => {
+              if (p.id === data.pieceId) return { ...p, position: null, isAlive: false };
+              return p;
+            });
+            const elimKey = movingPiece.owner === Player.White ? 'white' : 'black';
+            return { ...prev, pieces, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, eliminatedPieces: { ...prev.eliminatedPieces, [elimKey]: [...prev.eliminatedPieces[elimKey], movingPiece] } };
+          } else {
+            // Both die
+            const defender = getPieceAtPosition(pieces, to);
+            if (defender) {
+              pieces = pieces.map(p => {
+                if (p.id === data.pieceId) return { ...p, position: null, isAlive: false };
+                if (p.id === defender.id) return { ...p, position: null, isAlive: false };
+                return p;
+              });
+              const atkKey = movingPiece.owner === Player.White ? 'white' : 'black';
+              const defKey = defender.owner === Player.White ? 'white' : 'black';
+              const elimPieces = { ...prev.eliminatedPieces };
+              elimPieces[atkKey] = [...elimPieces[atkKey], movingPiece];
+              elimPieces[defKey] = [...elimPieces[defKey], defender];
+              return { ...prev, pieces, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, eliminatedPieces: elimPieces };
+            }
+          }
+        }
+        // Simple move
+        pieces = pieces.map(p => p.id === data.pieceId ? { ...p, position: to } : p);
+        return { ...prev, pieces, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black };
+      });
+    }) as never);
+
+    s.on('opponentDisconnected' as never, (() => {
+      setOnlineError('Opponent disconnected. Waiting 30s...');
+    }) as never);
+
+    s.on('opponentReconnected' as never, (() => {
+      setOnlineError('');
+    }) as never);
+  }, [user, getIdToken, playerSide, sounds]);
+
+  // ── Queue timer counter ──
+  useEffect(() => {
+    if (mode === 'queue') {
+      setQueueTime(0);
+      queueInterval.current = setInterval(() => setQueueTime(t => t + 1), 1000);
+      return () => { if (queueInterval.current) { clearInterval(queueInterval.current); queueInterval.current = null; } };
+    }
+  }, [mode]);
+
+  const joinRankedQueue = useCallback(async (tm: TimerMode) => {
+    setTimerMode(tm);
+    setMode('queue');
+    setOnlineError('');
+    await connectOnline();
+    const s = connectSocket();
+    s.emit('joinQueue' as never, { timerMode: tm } as never);
+  }, [connectOnline]);
+
+  const leaveQueue = useCallback(() => {
+    const s = connectSocket();
+    s.emit('leaveQueue' as never);
+    disconnectSocket();
+    setMode('menu');
+    if (queueInterval.current) { clearInterval(queueInterval.current); queueInterval.current = null; }
+  }, []);
+
+  const createLobby = useCallback(async (tm: TimerMode) => {
+    setTimerMode(tm);
+    setMode('custom-lobby');
+    setLobbyCode('');
+    setOnlineError('');
+    await connectOnline();
+    const s = connectSocket();
+    s.emit('createCustomLobby' as never, { timerMode: tm } as never);
+  }, [connectOnline]);
+
+  const joinLobby = useCallback(async () => {
+    if (!joinCode.trim()) return;
+    setOnlineError('');
+    await connectOnline();
+    const s = connectSocket();
+    s.emit('joinCustomLobby' as never, { code: joinCode.trim().toUpperCase() } as never);
+  }, [connectOnline, joinCode]);
 
   const startVsAI = useCallback(() => {
     let state = createInitialGameState();
@@ -210,10 +427,28 @@ export default function GameBoard() {
 
   const handleConfirmSetup = useCallback(() => {
     if (!isSetupComplete(gameState.pieces, playerSide)) return;
+    if (mode === 'online') {
+      // Send setup to server as SerializedPiece[]
+      const myPieces = gameState.pieces.filter(p => p.owner === playerSide && p.position);
+      const pieces = myPieces.map(p => ({
+        id: p.id,
+        rank: RANK_SHORT[p.rank],
+        owner: (p.owner === Player.White ? 'white' : 'black') as 'white' | 'black',
+        row: p.position!.row,
+        col: p.position!.col,
+        isEliminated: false,
+      }));
+      const s = connectSocket();
+      s.emit('submitSetup' as never, { pieces } as never);
+      // Don't advance to Playing locally — wait for gameStart from server
+      setSetupPieceId(null);
+      sounds?.click();
+      return;
+    }
     setGameState({ ...gameState, phase: GamePhase.Playing });
     setSetupPieceId(null);
     sounds?.click();
-  }, [gameState, playerSide, sounds]);
+  }, [gameState, playerSide, sounds, mode]);
 
   // ── Play click ──
   const handlePlaySquareClick = useCallback((row: number, col: number) => {
@@ -222,18 +457,26 @@ export default function GameBoard() {
     const clickedPiece = getPieceAtPosition(gameState.pieces, pos);
     if (selectedPieceId) {
       if (validMoves.some((m) => m.row === row && m.col === col)) {
-        try {
-          const piece = gameState.pieces.find((p) => p.id === selectedPieceId)!;
-          const newState = executeMove(gameState, selectedPieceId, pos);
-          setLastMove({ from: piece.position!, to: pos });
-          const last = newState.moveHistory[newState.moveHistory.length - 1];
-          if (last?.challenge) { setChallengeAnim(pos); sounds?.capture(); setTimeout(() => setChallengeAnim(null), 600); }
-          else sounds?.move();
-          setGameState(newState);
+        const piece = gameState.pieces.find((p) => p.id === selectedPieceId)!;
+        if (mode === 'online') {
+          // Emit move to server
+          const s = connectSocket();
+          s.emit('makeMove' as never, { pieceId: selectedPieceId, toRow: pos.row, toCol: pos.col } as never);
           setSelectedPieceId(null);
           setValidMoves([]);
-          if (newState.phase === GamePhase.GameOver) { newState.winner === playerSide ? sounds?.victory() : sounds?.defeat(); }
-        } catch { setSelectedPieceId(null); setValidMoves([]); }
+        } else {
+          try {
+            const newState = executeMove(gameState, selectedPieceId, pos);
+            setLastMove({ from: piece.position!, to: pos });
+            const last = newState.moveHistory[newState.moveHistory.length - 1];
+            if (last?.challenge) { setChallengeAnim(pos); sounds?.capture(); setTimeout(() => setChallengeAnim(null), 600); }
+            else sounds?.move();
+            setGameState(newState);
+            setSelectedPieceId(null);
+            setValidMoves([]);
+            if (newState.phase === GamePhase.GameOver) { newState.winner === playerSide ? sounds?.victory() : sounds?.defeat(); }
+          } catch { setSelectedPieceId(null); setValidMoves([]); }
+        }
       } else if (clickedPiece && clickedPiece.owner === playerSide) {
         setSelectedPieceId(clickedPiece.id);
         setValidMoves(getValidMoves(clickedPiece, gameState.pieces));
@@ -244,7 +487,7 @@ export default function GameBoard() {
       setValidMoves(getValidMoves(clickedPiece, gameState.pieces));
       sounds?.select();
     }
-  }, [gameState, selectedPieceId, validMoves, playerSide, sounds]);
+  }, [gameState, selectedPieceId, validMoves, playerSide, sounds, mode]);
 
   const handleSquareClick = useCallback((row: number, col: number) => {
     if (gameState.phase === GamePhase.Setup) handleSetupSquareClick(row, col);
@@ -252,6 +495,7 @@ export default function GameBoard() {
   }, [gameState.phase, handleSetupSquareClick, handlePlaySquareClick]);
 
   const handleNewGame = useCallback(() => {
+    disconnectSocket();
     setGameState(createInitialGameState());
     setMode('menu');
     setSelectedPieceId(null);
@@ -261,6 +505,8 @@ export default function GameBoard() {
     setSetupPieceId(null);
     setRevealAll(false);
     setShowGameOverModal(false);
+    setOnlineError('');
+    setEloChange(0);
   }, []);
 
   // ── Square background ──
@@ -390,9 +636,23 @@ export default function GameBoard() {
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
               Home
             </Link>
-            <Link href="/rules" className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium">
-              Rules
-            </Link>
+            <div className="flex items-center gap-4">
+              <Link href="/leaderboard" className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium">
+                Leaderboard
+              </Link>
+              {user ? (
+                <Link href="/profile" className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium">
+                  Profile
+                </Link>
+              ) : (
+                <Link href="/login" className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium">
+                  Sign In
+                </Link>
+              )}
+              <Link href="/rules" className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium">
+                Rules
+              </Link>
+            </div>
           </div>
         </header>
 
@@ -424,18 +684,69 @@ export default function GameBoard() {
                 </div>
               </button>
 
-              <button disabled className="w-full bg-[#0d1520]/40 border border-[#141e32] rounded-xl p-5 text-left opacity-50 cursor-not-allowed">
-                <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 bg-[#1a2744] rounded-lg flex items-center justify-center text-[#4a5a72] text-xl">
-                    <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z" /><path fillRule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clipRule="evenodd" /></svg>
+              {user ? (
+                <>
+                  {/* Ranked */}
+                  <div className="w-full bg-[#0d1520]/80 border border-[#1a2744] rounded-xl p-5">
+                    <div className="flex items-center gap-4 mb-4">
+                      <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-emerald-700 rounded-lg flex items-center justify-center text-white text-xl shadow-lg">
+                        <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
+                      </div>
+                      <div className="flex-1">
+                        <h3 className="text-white font-bold text-lg">Ranked Match</h3>
+                        <p className="text-[#6b7e9a] text-sm">Find opponent &bull; ELO rated &bull; {profile?.elo ?? 1200} rating</p>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(['30s', '1m', '2m'] as TimerMode[]).map(tm => (
+                        <button key={tm} onClick={() => joinRankedQueue(tm)} className="px-3 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-bold transition-all hover-lift">
+                          {TIMER_LABELS[tm]}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  <div className="flex-1">
-                    <h3 className="text-[#8a9ab5] font-bold text-lg">Online Multiplayer</h3>
-                    <p className="text-[#4a5a72] text-sm">Play against others — requires server</p>
+                  {/* Custom Lobby */}
+                  <div className="w-full bg-[#0d1520]/80 border border-[#1a2744] rounded-xl p-5">
+                    <div className="flex items-center gap-4 mb-4">
+                      <div className="w-12 h-12 bg-gradient-to-br from-purple-500 to-purple-700 rounded-lg flex items-center justify-center text-white text-xl shadow-lg">
+                        <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z" /></svg>
+                      </div>
+                      <div className="flex-1">
+                        <h3 className="text-white font-bold text-lg">Custom Game</h3>
+                        <p className="text-[#6b7e9a] text-sm">Create or join with a lobby code</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 mb-3">
+                      {(['none', '30s', '1m', '2m'] as TimerMode[]).map(tm => (
+                        <button key={tm} onClick={() => setTimerMode(tm)} className={`px-2 py-1.5 rounded text-xs font-medium transition-all ${timerMode === tm ? 'bg-purple-600 text-white' : 'bg-[#111b2e] text-[#8a9ab5] border border-[#1e2d4a]'}`}>
+                          {tm === 'none' ? 'No Timer' : tm}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => createLobby(timerMode)} className="flex-1 px-3 py-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-bold transition-all">
+                        Create Lobby
+                      </button>
+                      <button onClick={() => setMode('custom-join')} className="flex-1 px-3 py-2.5 bg-[#111b2e] border border-[#1e2d4a] text-[#8a9ab5] hover:text-white hover:border-purple-500/50 rounded-lg text-sm font-bold transition-all">
+                        Join Code
+                      </button>
+                    </div>
                   </div>
-                  <span className="text-[10px] tracking-wider uppercase text-[#4a5a72] bg-[#111b2e] px-2 py-1 rounded-full">Soon</span>
-                </div>
-              </button>
+                </>
+              ) : (
+                <Link href="/login" className="w-full bg-[#0d1520]/80 border border-[#1a2744] rounded-xl p-5 text-left hover:border-[#c8a951]/50 hover:shadow-lg group transition-all hover-lift block">
+                  <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-emerald-700 rounded-lg flex items-center justify-center text-white text-xl shadow-lg">
+                      <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clipRule="evenodd" /></svg>
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="text-white font-bold text-lg group-hover:text-[#c8a951] transition-colors">Online Multiplayer</h3>
+                      <p className="text-[#6b7e9a] text-sm">Sign in to play ranked &amp; custom games</p>
+                    </div>
+                    <svg className="w-5 h-5 text-[#2a3a5c] group-hover:text-[#c8a951] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                  </div>
+                </Link>
+              )}
             </div>
 
             {/* Settings section */}
@@ -484,6 +795,147 @@ export default function GameBoard() {
             onClose={() => setPreviewThemeId(null)}
           />
         )}
+      </div>
+    );
+  }
+
+  // ═══════════════════════════════════════
+  //  QUEUE SCREEN
+  // ═══════════════════════════════════════
+  if (mode === 'queue') {
+    return (
+      <div className="min-h-screen bg-[#080c14] flex flex-col">
+        <header className="relative border-b border-[#111b2e]">
+          <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+            <button onClick={leaveQueue} className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium flex items-center gap-2">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+              Cancel
+            </button>
+            <span className="text-[#8a9ab5] text-sm">Ranked &bull; {TIMER_LABELS[timerMode]}</span>
+          </div>
+        </header>
+        <main className="flex-1 flex items-center justify-center px-4">
+          <div className="text-center animate-fade-in-up">
+            {/* Animated spinner */}
+            <div className="relative w-24 h-24 mx-auto mb-8">
+              <div className="absolute inset-0 rounded-full border-2 border-[#1a2744]" />
+              <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-emerald-500 animate-spin" />
+              <div className="absolute inset-3 rounded-full border-2 border-transparent border-b-[#c8a951] animate-spin" style={{ animationDirection: 'reverse', animationDuration: '1.5s' }} />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-2xl">⚔️</span>
+              </div>
+            </div>
+            <h2 className="text-2xl font-bold text-white mb-2">Finding Opponent…</h2>
+            <p className="text-[#6b7e9a] text-sm mb-6">
+              {queuePlayers > 0 ? `${queuePlayers} player${queuePlayers > 1 ? 's' : ''} in queue` : 'Searching for players…'}
+            </p>
+            <div className="inline-flex items-center gap-2 bg-[#0d1520] border border-[#1a2744] rounded-full px-4 py-2 mb-8">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-white text-lg font-mono">{Math.floor(queueTime / 60).toString().padStart(2, '0')}:{(queueTime % 60).toString().padStart(2, '0')}</span>
+            </div>
+            {onlineError && <p className="text-red-400 text-sm mb-4">{onlineError}</p>}
+            <div>
+              <button onClick={leaveQueue} className="px-8 py-3 bg-red-600/20 hover:bg-red-600/40 border border-red-500/30 text-red-400 rounded-xl text-sm font-bold transition-all">
+                Cancel Search
+              </button>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  // ═══════════════════════════════════════
+  //  CUSTOM LOBBY (waiting for opponent)
+  // ═══════════════════════════════════════
+  if (mode === 'custom-lobby') {
+    return (
+      <div className="min-h-screen bg-[#080c14] flex flex-col">
+        <header className="relative border-b border-[#111b2e]">
+          <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+            <button onClick={() => { disconnectSocket(); setMode('menu'); }} className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium flex items-center gap-2">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+              Cancel
+            </button>
+            <span className="text-[#8a9ab5] text-sm">Custom &bull; {timerMode === 'none' ? 'No Timer' : timerMode}</span>
+          </div>
+        </header>
+        <main className="flex-1 flex items-center justify-center px-4">
+          <div className="text-center animate-fade-in-up max-w-sm w-full">
+            <div className="w-16 h-16 mx-auto mb-6 bg-gradient-to-br from-purple-500 to-purple-700 rounded-2xl flex items-center justify-center text-white text-3xl shadow-lg">
+              <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 20 20"><path d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z" /></svg>
+            </div>
+            <h2 className="text-2xl font-bold text-white mb-2">Lobby Created</h2>
+            <p className="text-[#6b7e9a] text-sm mb-6">Share this code with your opponent</p>
+            {lobbyCode ? (
+              <div className="bg-[#0d1520] border border-[#1a2744] rounded-xl p-6 mb-6">
+                <p className="text-[#6b7e9a] text-xs uppercase tracking-wider mb-2">Lobby Code</p>
+                <div className="text-4xl font-mono font-bold text-[#c8a951] tracking-[0.3em] mb-4">{lobbyCode}</div>
+                <button
+                  onClick={() => { navigator.clipboard.writeText(lobbyCode); }}
+                  className="px-4 py-2 bg-[#111b2e] border border-[#1e2d4a] text-[#8a9ab5] hover:text-white rounded-lg text-sm transition-all"
+                >
+                  Copy Code
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center gap-2 mb-6">
+                <div className="w-4 h-4 rounded-full border-2 border-transparent border-t-purple-500 animate-spin" />
+                <span className="text-[#6b7e9a] text-sm">Generating code…</span>
+              </div>
+            )}
+            <div className="flex items-center justify-center gap-2 text-[#6b7e9a] text-sm">
+              <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse" />
+              Waiting for opponent to join…
+            </div>
+            {onlineError && <p className="text-red-400 text-sm mt-4">{onlineError}</p>}
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  // ═══════════════════════════════════════
+  //  CUSTOM JOIN (enter code)
+  // ═══════════════════════════════════════
+  if (mode === 'custom-join') {
+    return (
+      <div className="min-h-screen bg-[#080c14] flex flex-col">
+        <header className="relative border-b border-[#111b2e]">
+          <div className="max-w-4xl mx-auto px-4 py-4">
+            <button onClick={() => { disconnectSocket(); setMode('menu'); }} className="text-[#8a9ab5] hover:text-[#c8a951] transition-colors text-sm font-medium flex items-center gap-2">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+              Back
+            </button>
+          </div>
+        </header>
+        <main className="flex-1 flex items-center justify-center px-4">
+          <div className="text-center animate-fade-in-up max-w-sm w-full">
+            <div className="w-16 h-16 mx-auto mb-6 bg-gradient-to-br from-purple-500 to-purple-700 rounded-2xl flex items-center justify-center text-white text-3xl shadow-lg">
+              <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 005.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 01-2.828-2.828l3-3z" clipRule="evenodd" /></svg>
+            </div>
+            <h2 className="text-2xl font-bold text-white mb-2">Join Game</h2>
+            <p className="text-[#6b7e9a] text-sm mb-6">Enter the lobby code from your opponent</p>
+            <div className="bg-[#0d1520] border border-[#1a2744] rounded-xl p-6 mb-4">
+              <input
+                type="text"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6))}
+                placeholder="ENTER CODE"
+                maxLength={6}
+                className="w-full bg-transparent text-center text-3xl font-mono font-bold text-white tracking-[0.3em] placeholder:text-[#2a3a5c] outline-none border-b-2 border-[#1a2744] focus:border-purple-500 pb-2 transition-colors"
+              />
+            </div>
+            <button
+              onClick={joinLobby}
+              disabled={joinCode.length < 6}
+              className={`w-full py-3 rounded-xl text-sm font-bold transition-all ${joinCode.length >= 6 ? 'bg-purple-600 hover:bg-purple-500 text-white' : 'bg-[#111b2e] text-[#4a5a72] cursor-not-allowed'}`}
+            >
+              Join Game
+            </button>
+            {onlineError && <p className="text-red-400 text-sm mt-4">{onlineError}</p>}
+          </div>
+        </main>
       </div>
     );
   }
@@ -573,6 +1025,21 @@ export default function GameBoard() {
 
         {/* Center board */}
         <div className="flex flex-col items-center gap-1.5 animate-fade-in">
+          {/* Opponent info + timer (above board) */}
+          {mode === 'online' && (
+            <div className="flex items-center justify-between w-full max-w-md px-1 mb-1">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-full bg-red-600/20 flex items-center justify-center text-xs font-bold text-red-400">{opponentName?.[0]?.toUpperCase() ?? '?'}</div>
+                <div>
+                  <span className="text-white text-sm font-medium">{opponentName || 'Opponent'}</span>
+                  {opponentElo > 0 && <span className="text-[#6b7e9a] text-xs ml-1.5">({opponentElo})</span>}
+                </div>
+              </div>
+              {onlineTimerMode !== 'none' && (
+                <TimerDisplay seconds={playerSide === Player.White ? onlineTimerBlack : onlineTimerWhite} isActive={!isMyTurn && gameState.phase === GamePhase.Playing} danger={false} />
+              )}
+            </div>
+          )}
           {gameState.phase === GamePhase.Playing && (
             <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium ${isMyTurn ? `${theme.accentPrimary} text-white` : `${theme.panelBg} ${theme.panelBorder} border ${theme.panelTextMuted}`}`}>
               <span className={`w-1.5 h-1.5 rounded-full ${isMyTurn ? 'bg-white' : 'bg-gray-500'} animate-pulse`} />
@@ -587,6 +1054,21 @@ export default function GameBoard() {
           <div className="flex items-center gap-1 text-[10px] animate-arbiter-glow"><span>⚖️</span><span className={theme.panelTextMuted}>Arbiter</span></div>
           {renderBoard(false)}
           <p className={`${theme.panelTextMuted} text-[10px]`}>Turn {Math.ceil(gameState.turnCount / 2) + 1}</p>
+          {/* Player info + timer (below board) */}
+          {mode === 'online' && (
+            <div className="flex items-center justify-between w-full max-w-md px-1 mt-1">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-full bg-emerald-600/20 flex items-center justify-center text-xs font-bold text-emerald-400">{profile?.username?.[0]?.toUpperCase() ?? 'Y'}</div>
+                <div>
+                  <span className="text-white text-sm font-medium">{profile?.username || 'You'}</span>
+                  {profile?.elo && <span className="text-[#6b7e9a] text-xs ml-1.5">({profile.elo})</span>}
+                </div>
+              </div>
+              {onlineTimerMode !== 'none' && (
+                <TimerDisplay seconds={playerSide === Player.White ? onlineTimerWhite : onlineTimerBlack} isActive={isMyTurn && gameState.phase === GamePhase.Playing} danger={true} />
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right panel: your losses + move history */}
@@ -620,10 +1102,24 @@ export default function GameBoard() {
           <div className={`${theme.panelBg} ${theme.panelBorder} border rounded-2xl p-8 max-w-sm w-full mx-4 text-center animate-bounce-in`}>
             <div className="text-5xl mb-4">{gameState.winner === playerSide ? '🏆' : '💀'}</div>
             <h2 className={`text-2xl font-bold mb-2 ${gameState.winner === playerSide ? 'text-[#c8a951]' : 'text-red-400'}`}>{gameState.winner === playerSide ? 'Victory!' : 'Defeat'}</h2>
-            <p className={`${theme.panelTextMuted} text-sm mb-6`}>{gameState.winReason}</p>
+            <p className={`${theme.panelTextMuted} text-sm mb-2`}>{gameState.winReason}</p>
+            {mode === 'online' && eloChange !== 0 && (
+              <p className={`text-sm font-bold mb-4 ${eloChange > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                ELO: {eloChange > 0 ? '+' : ''}{eloChange}
+              </p>
+            )}
+            {mode === 'online' && opponentName && (
+              <p className={`${theme.panelTextMuted} text-xs mb-4`}>vs {opponentName} ({opponentElo})</p>
+            )}
             <div className="space-y-2">
-              <button onClick={startVsAI} className={`w-full ${theme.accentPrimary} text-white py-3 rounded-xl font-bold hover:brightness-110 transition-all`}>Play Again</button>
-              <button onClick={handleNewGame} className={`w-full ${theme.panelBorder} border ${theme.panelText} py-3 rounded-xl font-medium hover:brightness-125 transition-all`}>Main Menu</button>
+              {mode === 'online' ? (
+                <button onClick={handleNewGame} className={`w-full ${theme.accentPrimary} text-white py-3 rounded-xl font-bold hover:brightness-110 transition-all`}>Back to Menu</button>
+              ) : (
+                <>
+                  <button onClick={startVsAI} className={`w-full ${theme.accentPrimary} text-white py-3 rounded-xl font-bold hover:brightness-110 transition-all`}>Play Again</button>
+                  <button onClick={handleNewGame} className={`w-full ${theme.panelBorder} border ${theme.panelText} py-3 rounded-xl font-medium hover:brightness-125 transition-all`}>Main Menu</button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -634,6 +1130,22 @@ export default function GameBoard() {
 }
 
 // ─── Small sub-components ───
+
+function TimerDisplay({ seconds, isActive, danger }: { seconds: number; isActive: boolean; danger: boolean }) {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  const low = danger && seconds <= 10 && isActive;
+  return (
+    <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-mono text-sm font-bold transition-all ${
+      low ? 'bg-red-600/30 text-red-400 animate-pulse border border-red-500/40' :
+      isActive ? 'bg-[#0d1520] border border-[#1a2744] text-white' :
+      'bg-[#0d1520]/50 border border-[#111b2e] text-[#6b7e9a]'
+    }`}>
+      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+      {mins}:{secs.toString().padStart(2, '0')}
+    </div>
+  );
+}
 
 function Header({ theme, onBack, showSettings }: { theme: BoardTheme; onBack?: () => void; showSettings?: () => void }) {
   return (

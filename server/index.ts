@@ -2,6 +2,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
 import { calculateEloChange } from './elo';
+import { adminAuth, adminDb } from './firebase-admin';
 import type {
   ClientToServerEvents,
   ServerToClientEvents,
@@ -11,22 +12,30 @@ import type {
   SerializedPiece,
   SerializedMove,
   ReplayData,
+  TimerMode,
 } from './types';
+import { TIMER_DURATIONS } from './types';
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 const httpServer = createServer();
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  cors: { origin: ALLOWED_ORIGIN, methods: ['GET', 'POST'] },
 });
 
 // ─── In-memory stores ───
 const rooms = new Map<string, RoomState>();
-const matchQueue: MatchRequest[] = [];
-const playerElos = new Map<string, number>(); // username -> elo
+const matchQueues: Record<TimerMode, MatchRequest[]> = {
+  'none': [],
+  '30s': [],
+  '1m': [],
+  '2m': [],
+};
 const replays = new Map<string, ReplayData>();
 const socketToRoom = new Map<string, string>();
-const socketToUsername = new Map<string, string>();
+const socketToUser = new Map<string, { uid: string; username: string; elo: number }>();
+const lobbyCodeToRoom = new Map<string, string>();
 
 // ─── Rank/challenge logic (mirrored from game engine) ───
 
@@ -75,41 +84,137 @@ function hasAdjacentEnemy(room: RoomState, row: number, col: number, owner: stri
   return false;
 }
 
+// ─── Lobby code generation ───
+
+function generateLobbyCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+// ─── Timer management ───
+
+function startTurnTimer(room: RoomState): void {
+  if (room.timerMode === 'none') return;
+  clearTurnTimer(room);
+  const duration = TIMER_DURATIONS[room.timerMode];
+  room.turnStartedAt = Date.now();
+  if (room.currentPlayer === 'white') {
+    room.timerWhite = duration;
+  } else {
+    room.timerBlack = duration;
+  }
+  room.turnTimer = setTimeout(() => {
+    if (room.phase !== 'playing') return;
+    const loser = room.currentPlayer;
+    const winner = loser === 'white' ? 'black' : 'white';
+    endGame(room, winner, `${loser === 'white' ? 'White' : 'Black'} ran out of time!`);
+  }, duration);
+}
+
+function clearTurnTimer(room: RoomState): void {
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
+  }
+}
+
+function getRemainingTime(room: RoomState): { white: number; black: number } {
+  if (room.timerMode === 'none') return { white: 0, black: 0 };
+  const duration = TIMER_DURATIONS[room.timerMode];
+  const elapsed = room.turnStartedAt ? Date.now() - room.turnStartedAt : 0;
+  if (room.currentPlayer === 'white') {
+    return { white: Math.max(0, duration - elapsed), black: duration };
+  } else {
+    return { white: duration, black: Math.max(0, duration - elapsed) };
+  }
+}
+
+// ─── Firestore helpers ───
+
+async function getUserProfile(uid: string): Promise<{ username: string; elo: number } | null> {
+  try {
+    const doc = await adminDb.collection('users').doc(uid).get();
+    if (!doc.exists) return null;
+    const data = doc.data()!;
+    return { username: data.username, elo: data.elo || 1200 };
+  } catch {
+    return null;
+  }
+}
+
+async function updateUserStats(uid: string, eloChange: number, won: boolean): Promise<void> {
+  try {
+    const ref = adminDb.collection('users').doc(uid);
+    const doc = await ref.get();
+    if (!doc.exists) return;
+    const data = doc.data()!;
+    await ref.update({
+      elo: (data.elo || 1200) + eloChange,
+      wins: (data.wins || 0) + (won ? 1 : 0),
+      losses: (data.losses || 0) + (won ? 0 : 1),
+    });
+  } catch (err) {
+    console.error('Failed to update user stats:', err);
+  }
+}
+
+async function saveMatchToFirestore(room: RoomState, replayId: string): Promise<void> {
+  try {
+    await adminDb.collection('matches').doc(replayId).set({
+      roomId: room.roomId,
+      whiteUid: room.white?.uid || '',
+      blackUid: room.black?.uid || '',
+      whiteUsername: room.white?.username || 'Unknown',
+      blackUsername: room.black?.username || 'Unknown',
+      winner: room.winner,
+      winReason: room.winReason,
+      timerMode: room.timerMode,
+      moveCount: room.moveHistory.length,
+      isRanked: !room.isCustom,
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    console.error('Failed to save match:', err);
+  }
+}
+
 // ─── Matchmaking ───
 
-function attemptMatch(): void {
-  if (matchQueue.length < 2) return;
+function attemptMatch(timerMode: TimerMode): void {
+  const queue = matchQueues[timerMode];
+  if (queue.length < 2) return;
 
-  // Sort by wait time, try to match closest ELO within threshold
-  matchQueue.sort((a, b) => a.timestamp - b.timestamp);
+  queue.sort((a, b) => a.timestamp - b.timestamp);
 
-  for (let i = 0; i < matchQueue.length - 1; i++) {
-    for (let j = i + 1; j < matchQueue.length; j++) {
-      const a = matchQueue[i];
-      const b = matchQueue[j];
+  for (let i = 0; i < queue.length - 1; i++) {
+    for (let j = i + 1; j < queue.length; j++) {
+      const a = queue[i];
+      const b = queue[j];
       const eloDiff = Math.abs(a.elo - b.elo);
       const waitTime = Date.now() - Math.min(a.timestamp, b.timestamp);
-      // Widen ELO range over time
       const threshold = 200 + waitTime / 1000 * 10;
       if (eloDiff <= threshold) {
-        // Match found
-        matchQueue.splice(j, 1);
-        matchQueue.splice(i, 1);
-        createMatchRoom(a, b);
+        queue.splice(j, 1);
+        queue.splice(i, 1);
+        createMatchRoom(a, b, timerMode);
         return;
       }
     }
   }
 }
 
-function createMatchRoom(a: MatchRequest, b: MatchRequest): void {
+function createMatchRoom(a: MatchRequest, b: MatchRequest, timerMode: TimerMode): void {
   const roomId = uuidv4().slice(0, 8);
   const coinFlip = Math.random() > 0.5;
   const whiteReq = coinFlip ? a : b;
   const blackReq = coinFlip ? b : a;
 
-  const white: ServerPlayer = { id: whiteReq.playerId, socketId: whiteReq.socketId, username: whiteReq.username, elo: whiteReq.elo, connected: true };
-  const black: ServerPlayer = { id: blackReq.playerId, socketId: blackReq.socketId, username: blackReq.username, elo: blackReq.elo, connected: true };
+  const white: ServerPlayer = { id: whiteReq.playerId, socketId: whiteReq.socketId, username: whiteReq.username, uid: whiteReq.uid, elo: whiteReq.elo, connected: true };
+  const black: ServerPlayer = { id: blackReq.playerId, socketId: blackReq.socketId, username: blackReq.username, uid: blackReq.uid, elo: blackReq.elo, connected: true };
 
   const room: RoomState = {
     roomId, white, black, arbiter: null,
@@ -121,6 +226,13 @@ function createMatchRoom(a: MatchRequest, b: MatchRequest): void {
     flagReachedBackRank: null,
     eliminatedPieces: { white: [], black: [] },
     createdAt: Date.now(),
+    timerMode,
+    timerWhite: TIMER_DURATIONS[timerMode],
+    timerBlack: TIMER_DURATIONS[timerMode],
+    turnStartedAt: null,
+    turnTimer: null,
+    isCustom: false,
+    lobbyCode: null,
   };
 
   rooms.set(roomId, room);
@@ -133,8 +245,8 @@ function createMatchRoom(a: MatchRequest, b: MatchRequest): void {
   whiteSocket?.join(roomId);
   blackSocket?.join(roomId);
 
-  whiteSocket?.emit('matchFound', { roomId, color: 'white', opponent: black.username, opponentElo: black.elo });
-  blackSocket?.emit('matchFound', { roomId, color: 'black', opponent: white.username, opponentElo: white.elo });
+  whiteSocket?.emit('matchFound', { roomId, color: 'white', opponent: black.username, opponentElo: black.elo, timerMode });
+  blackSocket?.emit('matchFound', { roomId, color: 'black', opponent: white.username, opponentElo: white.elo, timerMode });
 
   // Start setup phase
   io.to(roomId).emit('setupPhase');
@@ -162,6 +274,7 @@ function endGame(room: RoomState, winner: 'white' | 'black', reason: string): vo
   room.winner = winner;
   room.winReason = reason;
   room.phase = 'gameover';
+  clearTurnTimer(room);
 
   const replayId = saveReplay(room);
 
@@ -169,14 +282,19 @@ function endGame(room: RoomState, winner: 'white' | 'black', reason: string): vo
   const loserPlayer = winner === 'white' ? room.black : room.white;
 
   let eloChange = 0;
-  if (winnerPlayer && loserPlayer) {
+  if (winnerPlayer && loserPlayer && !room.isCustom) {
     const { winnerChange, loserChange } = calculateEloChange(winnerPlayer.elo, loserPlayer.elo);
     eloChange = winnerChange;
-    playerElos.set(winnerPlayer.username, winnerPlayer.elo + winnerChange);
-    playerElos.set(loserPlayer.username, loserPlayer.elo + loserChange);
     winnerPlayer.elo += winnerChange;
     loserPlayer.elo += loserChange;
+
+    // Persist to Firestore
+    updateUserStats(winnerPlayer.uid, winnerChange, true);
+    updateUserStats(loserPlayer.uid, loserChange, false);
   }
+
+  // Save match record
+  saveMatchToFirestore(room, replayId);
 
   const winnerSocket = winner === 'white' ? room.white?.socketId : room.black?.socketId;
   const loserSocket = winner === 'white' ? room.black?.socketId : room.white?.socketId;
@@ -191,6 +309,11 @@ function endGame(room: RoomState, winner: 'white' | 'black', reason: string): vo
   if (room.arbiter) {
     io.sockets.sockets.get(room.arbiter)?.emit('gameOver', { winner, reason, eloChange: 0, replayId });
   }
+
+  // Clean up lobby code
+  if (room.lobbyCode) {
+    lobbyCodeToRoom.delete(room.lobbyCode);
+  }
 }
 
 // ─── Socket handlers ───
@@ -198,49 +321,67 @@ function endGame(room: RoomState, winner: 'white' | 'black', reason: string): vo
 io.on('connection', (socket) => {
   console.log(`Connected: ${socket.id}`);
 
-  socket.on('joinQueue', ({ username }) => {
-    const sanitized = username.slice(0, 20).replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!sanitized) {
-      socket.emit('error', { message: 'Invalid username' });
-      return;
+  // ─── Authentication ───
+  socket.on('authenticate', async ({ token }) => {
+    try {
+      const decoded = await adminAuth.verifyIdToken(token);
+      const profile = await getUserProfile(decoded.uid);
+      if (!profile) {
+        socket.emit('authError', { message: 'User profile not found. Please sign up first.' });
+        return;
+      }
+      socketToUser.set(socket.id, { uid: decoded.uid, username: profile.username, elo: profile.elo });
+      socket.emit('authenticated', { uid: decoded.uid, username: profile.username, elo: profile.elo });
+    } catch {
+      socket.emit('authError', { message: 'Invalid authentication token' });
     }
-    socketToUsername.set(socket.id, sanitized);
+  });
 
-    const elo = playerElos.get(sanitized) || 1200;
-    playerElos.set(sanitized, elo);
+  // ─── Queue ───
+  socket.on('joinQueue', ({ timerMode = '1m' }) => {
+    const user = socketToUser.get(socket.id);
+    if (!user) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
-    // Remove any existing queue entry for this socket
-    const idx = matchQueue.findIndex(m => m.socketId === socket.id);
-    if (idx >= 0) matchQueue.splice(idx, 1);
+    const queue = matchQueues[timerMode];
+    const idx = queue.findIndex(m => m.socketId === socket.id);
+    if (idx >= 0) queue.splice(idx, 1);
 
-    matchQueue.push({
+    queue.push({
       playerId: socket.id,
       socketId: socket.id,
-      username: sanitized,
-      elo,
+      username: user.username,
+      uid: user.uid,
+      elo: user.elo,
+      timerMode,
       timestamp: Date.now(),
     });
 
-    socket.emit('queueUpdate', { position: matchQueue.length, playersInQueue: matchQueue.length });
-    socket.emit('playerInfo', { elo, username: sanitized });
-    attemptMatch();
+    socket.emit('queueUpdate', { position: queue.length, playersInQueue: queue.length });
+    socket.emit('playerInfo', { elo: user.elo, username: user.username });
+    attemptMatch(timerMode);
   });
 
   socket.on('leaveQueue', () => {
-    const idx = matchQueue.findIndex(m => m.socketId === socket.id);
-    if (idx >= 0) matchQueue.splice(idx, 1);
+    for (const mode of Object.keys(matchQueues) as TimerMode[]) {
+      const queue = matchQueues[mode];
+      const idx = queue.findIndex(m => m.socketId === socket.id);
+      if (idx >= 0) queue.splice(idx, 1);
+    }
   });
 
-  socket.on('createRoom', ({ username }) => {
-    const sanitized = username.slice(0, 20).replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!sanitized) { socket.emit('error', { message: 'Invalid username' }); return; }
-    socketToUsername.set(socket.id, sanitized);
+  // ─── Custom Lobby ───
+  socket.on('createCustomLobby', ({ timerMode = 'none' }) => {
+    const user = socketToUser.get(socket.id);
+    if (!user) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
     const roomId = uuidv4().slice(0, 8);
-    const elo = playerElos.get(sanitized) || 1200;
-    playerElos.set(sanitized, elo);
+    let code = generateLobbyCode();
+    while (lobbyCodeToRoom.has(code)) code = generateLobbyCode();
 
-    const white: ServerPlayer = { id: socket.id, socketId: socket.id, username: sanitized, elo, connected: true };
+    const white: ServerPlayer = {
+      id: socket.id, socketId: socket.id,
+      username: user.username, uid: user.uid, elo: user.elo, connected: true,
+    };
 
     const room: RoomState = {
       roomId, white, black: null, arbiter: null,
@@ -252,39 +393,112 @@ io.on('connection', (socket) => {
       flagReachedBackRank: null,
       eliminatedPieces: { white: [], black: [] },
       createdAt: Date.now(),
+      timerMode,
+      timerWhite: TIMER_DURATIONS[timerMode],
+      timerBlack: TIMER_DURATIONS[timerMode],
+      turnStartedAt: null,
+      turnTimer: null,
+      isCustom: true,
+      lobbyCode: code,
+    };
+
+    rooms.set(roomId, room);
+    lobbyCodeToRoom.set(code, roomId);
+    socketToRoom.set(socket.id, roomId);
+    socket.join(roomId);
+    socket.emit('lobbyCreated', { code, roomId });
+    socket.emit('playerInfo', { elo: user.elo, username: user.username });
+  });
+
+  socket.on('joinCustomLobby', ({ code }) => {
+    const user = socketToUser.get(socket.id);
+    if (!user) { socket.emit('error', { message: 'Not authenticated' }); return; }
+
+    const upperedCode = code.toUpperCase().trim();
+    const roomId = lobbyCodeToRoom.get(upperedCode);
+    if (!roomId) { socket.emit('error', { message: 'Lobby not found' }); return; }
+
+    const room = rooms.get(roomId);
+    if (!room) { socket.emit('error', { message: 'Room not found' }); return; }
+    if (room.phase !== 'waiting') { socket.emit('error', { message: 'Game already in progress' }); return; }
+    if (room.black) { socket.emit('error', { message: 'Lobby is full' }); return; }
+
+    room.black = {
+      id: socket.id, socketId: socket.id,
+      username: user.username, uid: user.uid, elo: user.elo, connected: true,
+    };
+    room.phase = 'setup';
+    socketToRoom.set(socket.id, roomId);
+    socket.join(roomId);
+
+    socket.emit('roomJoined', { roomId, color: 'black' });
+    socket.emit('playerInfo', { elo: user.elo, username: user.username });
+
+    if (room.white) {
+      io.sockets.sockets.get(room.white.socketId)?.emit('opponentJoined', { opponent: user.username, opponentElo: user.elo });
+    }
+    io.to(roomId).emit('setupPhase');
+  });
+
+  // ─── Legacy room ───
+  socket.on('createRoom', ({ timerMode = 'none' }) => {
+    const user = socketToUser.get(socket.id);
+    if (!user) { socket.emit('error', { message: 'Not authenticated' }); return; }
+
+    const roomId = uuidv4().slice(0, 8);
+    const white: ServerPlayer = {
+      id: socket.id, socketId: socket.id,
+      username: user.username, uid: user.uid, elo: user.elo, connected: true,
+    };
+
+    const room: RoomState = {
+      roomId, white, black: null, arbiter: null,
+      phase: 'waiting',
+      setupDone: { white: false, black: false },
+      whitePieces: [], blackPieces: [],
+      currentPlayer: 'white', turnCount: 0,
+      moveHistory: [], winner: null, winReason: null,
+      flagReachedBackRank: null,
+      eliminatedPieces: { white: [], black: [] },
+      createdAt: Date.now(),
+      timerMode,
+      timerWhite: TIMER_DURATIONS[timerMode],
+      timerBlack: TIMER_DURATIONS[timerMode],
+      turnStartedAt: null,
+      turnTimer: null,
+      isCustom: false,
+      lobbyCode: null,
     };
 
     rooms.set(roomId, room);
     socketToRoom.set(socket.id, roomId);
     socket.join(roomId);
     socket.emit('roomCreated', { roomId });
-    socket.emit('playerInfo', { elo, username: sanitized });
+    socket.emit('playerInfo', { elo: user.elo, username: user.username });
   });
 
-  socket.on('joinRoom', ({ roomId, username }) => {
-    const sanitized = username.slice(0, 20).replace(/[^a-zA-Z0-9_-]/g, '');
-    if (!sanitized) { socket.emit('error', { message: 'Invalid username' }); return; }
+  socket.on('joinRoom', ({ roomId }) => {
+    const user = socketToUser.get(socket.id);
+    if (!user) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
     const room = rooms.get(roomId);
     if (!room) { socket.emit('error', { message: 'Room not found' }); return; }
     if (room.phase !== 'waiting') { socket.emit('error', { message: 'Game already in progress' }); return; }
     if (room.black) { socket.emit('error', { message: 'Room is full' }); return; }
 
-    socketToUsername.set(socket.id, sanitized);
-    const elo = playerElos.get(sanitized) || 1200;
-    playerElos.set(sanitized, elo);
-
-    room.black = { id: socket.id, socketId: socket.id, username: sanitized, elo, connected: true };
+    room.black = {
+      id: socket.id, socketId: socket.id,
+      username: user.username, uid: user.uid, elo: user.elo, connected: true,
+    };
     room.phase = 'setup';
     socketToRoom.set(socket.id, roomId);
     socket.join(roomId);
 
     socket.emit('roomJoined', { roomId, color: 'black' });
-    socket.emit('playerInfo', { elo, username: sanitized });
+    socket.emit('playerInfo', { elo: user.elo, username: user.username });
 
-    // Notify white
     if (room.white) {
-      io.sockets.sockets.get(room.white.socketId)?.emit('opponentJoined', { opponent: sanitized });
+      io.sockets.sockets.get(room.white.socketId)?.emit('opponentJoined', { opponent: user.username, opponentElo: user.elo });
     }
     io.to(roomId).emit('setupPhase');
   });
@@ -337,7 +551,8 @@ io.on('connection', (socket) => {
     if (room.setupDone.white && room.setupDone.black) {
       room.phase = 'playing';
       room.currentPlayer = 'white';
-      io.to(roomId).emit('gameStart', { currentPlayer: 'white' });
+      io.to(roomId).emit('gameStart', { currentPlayer: 'white', timerMode: room.timerMode });
+      startTurnTimer(room);
     }
   });
 
@@ -469,12 +684,21 @@ io.on('connection', (socket) => {
     room.turnCount++;
     room.currentPlayer = room.currentPlayer === 'white' ? 'black' : 'white';
 
+    // Restart timer for next player
+    if (room.phase === 'playing') {
+      startTurnTimer(room);
+    }
+
+    const timers = getRemainingTime(room);
+
     // Emit to players (they don't see opponent ranks)
     const moveEvent = {
       pieceId, fromRow, fromCol, toRow, toCol,
       challenge: challengeData ? { result: challengeData.result, eliminatedPieceIds } : undefined,
       currentPlayer: room.currentPlayer,
       turnCount: room.turnCount,
+      timerWhite: timers.white,
+      timerBlack: timers.black,
     };
 
     if (room.white?.socketId) io.sockets.sockets.get(room.white.socketId)?.emit('moveMade', moveEvent);
@@ -511,12 +735,43 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ─── Leaderboard ───
+  socket.on('getLeaderboard', async ({ limit = 50, offset = 0 }) => {
+    try {
+      const snap = await adminDb.collection('users')
+        .orderBy('elo', 'desc')
+        .limit(Math.min(limit, 100))
+        .offset(offset)
+        .get();
+
+      const players = snap.docs.map((doc, i) => {
+        const data = doc.data();
+        return {
+          uid: doc.id,
+          username: data.username,
+          elo: data.elo || 1200,
+          wins: data.wins || 0,
+          losses: data.losses || 0,
+          draws: data.draws || 0,
+          rank: offset + i + 1,
+        };
+      });
+
+      socket.emit('leaderboard', { players });
+    } catch {
+      socket.emit('error', { message: 'Failed to load leaderboard' });
+    }
+  });
+
   socket.on('disconnect', () => {
     console.log(`Disconnected: ${socket.id}`);
 
-    // Remove from queue
-    const idx = matchQueue.findIndex(m => m.socketId === socket.id);
-    if (idx >= 0) matchQueue.splice(idx, 1);
+    // Remove from all queues
+    for (const mode of Object.keys(matchQueues) as TimerMode[]) {
+      const queue = matchQueues[mode];
+      const idx = queue.findIndex(m => m.socketId === socket.id);
+      if (idx >= 0) queue.splice(idx, 1);
+    }
 
     // Handle room
     const roomId = socketToRoom.get(socket.id);
@@ -551,12 +806,16 @@ io.on('connection', (socket) => {
       }
       socketToRoom.delete(socket.id);
     }
-    socketToUsername.delete(socket.id);
+    socketToUser.delete(socket.id);
   });
 });
 
-// Run matchmaking every 2 seconds
-setInterval(attemptMatch, 2000);
+// Run matchmaking for all timer modes every 2 seconds
+setInterval(() => {
+  for (const mode of Object.keys(matchQueues) as TimerMode[]) {
+    attemptMatch(mode);
+  }
+}, 2000);
 
 httpServer.listen(PORT, () => {
   console.log(`Game server running on port ${PORT}`);

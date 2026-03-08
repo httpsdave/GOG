@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: gog-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npx tsx server/index.ts
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_SERVICE_ACCOUNT_KEY
+        sync: false   # set manually in Render dashboard (secret)
+      - key: ALLOWED_ORIGIN
+        sync: false   # set to your Vercel URL e.g. https://your-app.vercel.app

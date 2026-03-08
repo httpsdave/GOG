@@ -1,9 +1,19 @@
 // Server-side types for multiplayer
 
+export type TimerMode = 'none' | '30s' | '1m' | '2m';
+
+export const TIMER_DURATIONS: Record<TimerMode, number> = {
+  'none': 0,
+  '30s': 30000,
+  '1m': 60000,
+  '2m': 120000,
+};
+
 export interface ServerPlayer {
   id: string;
   socketId: string;
   username: string;
+  uid: string; // Firebase UID
   elo: number;
   connected: boolean;
 }
@@ -12,7 +22,9 @@ export interface MatchRequest {
   playerId: string;
   socketId: string;
   username: string;
+  uid: string;
   elo: number;
+  timerMode: TimerMode;
   timestamp: number;
 }
 
@@ -23,7 +35,6 @@ export interface RoomState {
   arbiter: string | null; // socketId of arbiter connection
   phase: 'waiting' | 'setup' | 'playing' | 'gameover';
   setupDone: { white: boolean; black: boolean };
-  // Pieces stored server-side — arbiter knows all, players see only their own
   whitePieces: SerializedPiece[];
   blackPieces: SerializedPiece[];
   currentPlayer: 'white' | 'black';
@@ -34,6 +45,15 @@ export interface RoomState {
   flagReachedBackRank: { player: 'white' | 'black'; turnReached: number } | null;
   eliminatedPieces: { white: SerializedPiece[]; black: SerializedPiece[] };
   createdAt: number;
+  // Timer
+  timerMode: TimerMode;
+  timerWhite: number; // ms remaining (for per-move timer, reset each turn)
+  timerBlack: number;
+  turnStartedAt: number | null; // timestamp when current turn began
+  turnTimer: ReturnType<typeof setTimeout> | null;
+  // Custom lobby
+  isCustom: boolean;
+  lobbyCode: string | null;
 }
 
 export interface SerializedPiece {
@@ -74,28 +94,35 @@ export interface ReplayData {
 
 // Client -> Server events
 export interface ClientToServerEvents {
-  joinQueue: (data: { username: string }) => void;
+  authenticate: (data: { token: string }) => void;
+  joinQueue: (data: { timerMode?: TimerMode }) => void;
   leaveQueue: () => void;
-  createRoom: (data: { username: string }) => void;
-  joinRoom: (data: { roomId: string; username: string }) => void;
+  createRoom: (data: { timerMode?: TimerMode }) => void;
+  joinRoom: (data: { roomId: string }) => void;
+  createCustomLobby: (data: { timerMode?: TimerMode }) => void;
+  joinCustomLobby: (data: { code: string }) => void;
   joinAsArbiter: (data: { roomId: string }) => void;
   submitSetup: (data: { pieces: SerializedPiece[] }) => void;
   makeMove: (data: { pieceId: string; toRow: number; toCol: number }) => void;
   requestRematch: () => void;
   resign: () => void;
   getReplay: (data: { replayId: string }) => void;
+  getLeaderboard: (data: { limit?: number; offset?: number }) => void;
 }
 
 // Server -> Client events
 export interface ServerToClientEvents {
+  authenticated: (data: { uid: string; username: string; elo: number }) => void;
+  authError: (data: { message: string }) => void;
   queueUpdate: (data: { position: number; playersInQueue: number }) => void;
-  matchFound: (data: { roomId: string; color: 'white' | 'black'; opponent: string; opponentElo: number }) => void;
+  matchFound: (data: { roomId: string; color: 'white' | 'black'; opponent: string; opponentElo: number; timerMode: TimerMode }) => void;
   roomJoined: (data: { roomId: string; color: 'white' | 'black' }) => void;
   roomCreated: (data: { roomId: string }) => void;
-  opponentJoined: (data: { opponent: string }) => void;
+  lobbyCreated: (data: { code: string; roomId: string }) => void;
+  opponentJoined: (data: { opponent: string; opponentElo: number }) => void;
   setupPhase: () => void;
   opponentReady: () => void;
-  gameStart: (data: { currentPlayer: 'white' | 'black' }) => void;
+  gameStart: (data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode }) => void;
   moveMade: (data: {
     pieceId: string;
     fromRow: number;
@@ -105,8 +132,10 @@ export interface ServerToClientEvents {
     challenge?: { result: string; eliminatedPieceIds: string[] };
     currentPlayer: 'white' | 'black';
     turnCount: number;
+    timerWhite: number;
+    timerBlack: number;
   }) => void;
-  // Arbiter sees full challenge details
+  timerUpdate: (data: { white: number; black: number; currentPlayer: 'white' | 'black' }) => void;
   arbiterUpdate: (data: {
     pieceId: string;
     fromRow: number;
@@ -126,4 +155,5 @@ export interface ServerToClientEvents {
   error: (data: { message: string }) => void;
   replayData: (data: ReplayData) => void;
   playerInfo: (data: { elo: number; username: string }) => void;
+  leaderboard: (data: { players: Array<{ username: string; elo: number; wins: number; losses: number; rank: number }> }) => void;
 }
