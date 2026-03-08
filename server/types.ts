@@ -51,9 +51,14 @@ export interface RoomState {
   timerBlack: number;
   turnStartedAt: number | null; // timestamp when current turn began
   turnTimer: ReturnType<typeof setTimeout> | null;
+  timerInterval: ReturnType<typeof setInterval> | null;
   // Custom lobby
   isCustom: boolean;
   lobbyCode: string | null;
+  // Setup timer
+  setupTimer: ReturnType<typeof setTimeout> | null;
+  setupTimerInterval: ReturnType<typeof setInterval> | null;
+  setupStartedAt: number | null;
 }
 
 export interface SerializedPiece {
@@ -122,6 +127,9 @@ export interface ServerToClientEvents {
   opponentJoined: (data: { opponent: string; opponentElo: number }) => void;
   setupPhase: () => void;
   opponentReady: () => void;
+  setupTimerUpdate: (data: { remaining: number }) => void;
+  opponentPieces: (data: { pieces: { id: string; row: number; col: number }[] }) => void;
+  autoDeployed: (data: { pieces: { id: string; rank: string; row: number; col: number }[] }) => void;
   gameStart: (data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode }) => void;
   moveMade: (data: {
     pieceId: string;
@@ -135,7 +143,7 @@ export interface ServerToClientEvents {
     timerWhite: number;
     timerBlack: number;
   }) => void;
-  timerUpdate: (data: { white: number; black: number; currentPlayer: 'white' | 'black' }) => void;
+  timerUpdate: (data: { white: number; black: number }) => void;
   arbiterUpdate: (data: {
     pieceId: string;
     fromRow: number;

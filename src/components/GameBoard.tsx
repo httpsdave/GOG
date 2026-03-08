@@ -108,6 +108,7 @@ export default function GameBoard() {
   const [onlineTimerMode, setOnlineTimerMode] = useState<TimerMode>('none');
   const [onlineError, setOnlineError] = useState('');
   const [eloChange, setEloChange] = useState(0);
+  const [setupTimeLeft, setSetupTimeLeft] = useState(0);
   const queueInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const theme = THEMES[themeId];
@@ -205,6 +206,27 @@ export default function GameBoard() {
       setGameState(state);
       setRevealAll(false);
       setShowGameOverModal(false);
+      setSetupTimeLeft(120);
+    }) as never);
+
+    s.on('setupTimerUpdate' as never, ((data: { remaining: number }) => {
+      setSetupTimeLeft(data.remaining);
+    }) as never);
+
+    s.on('autoDeployed' as never, ((data: { pieces: { id: string; rank: string; row: number; col: number }[] }) => {
+      // Server auto-deployed our pieces — update local game state
+      setGameState(prev => {
+        const myPieces = prev.pieces.filter(p => p.owner === playerSide);
+        const updatedPieces = prev.pieces.map(p => {
+          if (p.owner !== playerSide) return p;
+          const idx = myPieces.indexOf(p);
+          if (idx >= 0 && idx < data.pieces.length) {
+            return { ...p, id: data.pieces[idx].id, position: { row: data.pieces[idx].row, col: data.pieces[idx].col } };
+          }
+          return p;
+        });
+        return { ...prev, pieces: updatedPieces };
+      });
     }) as never);
 
     s.on('gameStart' as never, ((data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode }) => {
@@ -214,6 +236,24 @@ export default function GameBoard() {
 
     s.on('opponentReady' as never, (() => {
       sounds?.click();
+    }) as never);
+
+    s.on('opponentPieces' as never, ((data: { pieces: { id: string; row: number; col: number }[] }) => {
+      // Place opponent pieces on the board (positions only, no ranks revealed)
+      setGameState(prev => {
+        const opponentOwner = playerSide === Player.White ? Player.Black : Player.White;
+        const opponentPieces = prev.pieces.filter(p => p.owner === opponentOwner);
+        // Map server piece IDs to local pieces (by index, since both are ordered the same way)
+        const updatedPieces = prev.pieces.map(p => {
+          if (p.owner !== opponentOwner) return p;
+          const idx = opponentPieces.indexOf(p);
+          if (idx >= 0 && idx < data.pieces.length) {
+            return { ...p, id: data.pieces[idx].id, position: { row: data.pieces[idx].row, col: data.pieces[idx].col } };
+          }
+          return p;
+        });
+        return { ...prev, pieces: updatedPieces };
+      });
     }) as never);
 
     s.on('gameOver' as never, ((data: { winner: 'white' | 'black'; reason: string; eloChange: number }) => {
@@ -228,8 +268,8 @@ export default function GameBoard() {
     }) as never);
 
     s.on('timerUpdate' as never, ((data: { white: number; black: number }) => {
-      setOnlineTimerWhite(data.white);
-      setOnlineTimerBlack(data.black);
+      setOnlineTimerWhite(Math.ceil(data.white / 1000));
+      setOnlineTimerBlack(Math.ceil(data.black / 1000));
     }) as never);
 
     s.on('moveMade' as never, ((data: { pieceId: string; fromRow: number; fromCol: number; toRow: number; toCol: number; challenge?: { result: string; eliminatedPieceIds: string[] }; currentPlayer: 'white' | 'black'; turnCount: number; timerWhite: number; timerBlack: number }) => {
@@ -243,8 +283,8 @@ export default function GameBoard() {
       } else {
         sounds?.move();
       }
-      setOnlineTimerWhite(data.timerWhite);
-      setOnlineTimerBlack(data.timerBlack);
+      setOnlineTimerWhite(Math.ceil(data.timerWhite / 1000));
+      setOnlineTimerBlack(Math.ceil(data.timerBlack / 1000));
       setGameState(prev => {
         let pieces = [...prev.pieces];
         const movingPiece = pieces.find(p => p.id === data.pieceId);
@@ -956,6 +996,15 @@ export default function GameBoard() {
           <div className="animate-fade-in">{renderBoard(true)}</div>
           <div className={`${theme.panelBg} ${theme.panelBorder} border rounded-xl p-4 w-full max-w-xs animate-slide-right`}>
             <h3 className={`${theme.headerColor} font-bold text-base mb-1`}>Deploy Your Forces</h3>
+            {mode === 'online' && setupTimeLeft > 0 && (
+              <div className={`flex items-center gap-2 mb-2 px-2 py-1 rounded-lg ${setupTimeLeft <= 30 ? 'bg-red-900/30 border border-red-700/50' : 'bg-[#111b2e] border border-[#1a2744]'}`}>
+                <svg className="w-4 h-4 text-[#c8a951]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                <span className={`text-sm font-mono font-bold ${setupTimeLeft <= 30 ? 'text-red-400 animate-pulse' : 'text-[#c8a951]'}`}>
+                  {Math.floor(setupTimeLeft / 60)}:{(setupTimeLeft % 60).toString().padStart(2, '0')}
+                </span>
+                <span className="text-[#6b7e9a] text-xs">to deploy</span>
+              </div>
+            )}
             <p className={`${theme.panelTextMuted} text-xs mb-1`}>Click or drag pieces into the highlighted zone (bottom 3 rows).</p>
             <p className={`${theme.panelTextMuted} text-xs mb-3`}><span className={`${theme.headerColor} font-bold`}>{placedCount}</span> / 21 placed</p>
             {unplacedPieces.length > 0 && (

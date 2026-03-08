@@ -16,6 +16,8 @@ import type {
 } from './types';
 import { TIMER_DURATIONS } from './types';
 
+const SETUP_DURATION = 120000; // 2 minutes for setup phase
+
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
@@ -97,6 +99,121 @@ function generateLobbyCode(): string {
 
 // ─── Timer management ───
 
+const RANK_PIECES: [string, number][] = [
+  ['5*G', 1], ['4*G', 1], ['3*G', 1], ['2*G', 1], ['1*G', 1],
+  ['COL', 1], ['LTC', 1], ['MAJ', 1], ['CPT', 1], ['1LT', 1],
+  ['2LT', 1], ['SGT', 1], ['PVT', 6], ['SPY', 2], ['FLG', 1],
+];
+
+function generateRandomServerSetup(owner: 'white' | 'black'): SerializedPiece[] {
+  const startRow = owner === 'white' ? 0 : 5;
+  const positions: { row: number; col: number }[] = [];
+  for (let r = startRow; r < startRow + 3; r++) {
+    for (let c = 0; c < 9; c++) {
+      positions.push({ row: r, col: c });
+    }
+  }
+  // Shuffle positions
+  for (let i = positions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [positions[i], positions[j]] = [positions[j], positions[i]];
+  }
+  const pieces: SerializedPiece[] = [];
+  let idx = 0;
+  let idCounter = 0;
+  for (const [rank, count] of RANK_PIECES) {
+    for (let i = 0; i < count; i++) {
+      pieces.push({
+        id: `${owner}-${rank}-${idCounter++}`,
+        rank,
+        owner,
+        row: positions[idx].row,
+        col: positions[idx].col,
+        isEliminated: false,
+      });
+      idx++;
+    }
+  }
+  return pieces;
+}
+
+function startSetupTimer(room: RoomState): void {
+  clearSetupTimer(room);
+  room.setupStartedAt = Date.now();
+
+  // Emit countdown every second
+  room.setupTimerInterval = setInterval(() => {
+    if (room.phase !== 'setup' || !room.setupStartedAt) {
+      clearSetupTimer(room);
+      return;
+    }
+    const remaining = Math.max(0, SETUP_DURATION - (Date.now() - room.setupStartedAt));
+    io.to(room.roomId).emit('setupTimerUpdate', { remaining: Math.ceil(remaining / 1000) });
+  }, 1000);
+
+  // Auto-deploy after SETUP_DURATION
+  room.setupTimer = setTimeout(() => {
+    if (room.phase !== 'setup') return;
+
+    // Track who gets auto-deployed
+    const whiteAutoDeployed = !room.setupDone.white;
+    const blackAutoDeployed = !room.setupDone.black;
+
+    // Auto-deploy for any player who hasn't submitted
+    if (whiteAutoDeployed) {
+      room.whitePieces = generateRandomServerSetup('white');
+      room.setupDone.white = true;
+    }
+    if (blackAutoDeployed) {
+      room.blackPieces = generateRandomServerSetup('black');
+      room.setupDone.black = true;
+    }
+
+    clearSetupTimer(room);
+    room.phase = 'playing';
+    room.currentPlayer = 'white';
+
+    // Send opponent piece positions to each player
+    const whiteSocket = room.white?.socketId ? io.sockets.sockets.get(room.white.socketId) : null;
+    const blackSocket = room.black?.socketId ? io.sockets.sockets.get(room.black.socketId) : null;
+
+    if (whiteSocket) {
+      if (whiteAutoDeployed) {
+        whiteSocket.emit('autoDeployed', {
+          pieces: room.whitePieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, rank: p.rank, row: p.row!, col: p.col! })),
+        });
+      }
+      whiteSocket.emit('opponentPieces', {
+        pieces: room.blackPieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+      });
+    }
+    if (blackSocket) {
+      if (blackAutoDeployed) {
+        blackSocket.emit('autoDeployed', {
+          pieces: room.blackPieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, rank: p.rank, row: p.row!, col: p.col! })),
+        });
+      }
+      blackSocket.emit('opponentPieces', {
+        pieces: room.whitePieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+      });
+    }
+
+    io.to(room.roomId).emit('gameStart', { currentPlayer: 'white', timerMode: room.timerMode });
+    startTurnTimer(room);
+  }, SETUP_DURATION);
+}
+
+function clearSetupTimer(room: RoomState): void {
+  if (room.setupTimer) {
+    clearTimeout(room.setupTimer);
+    room.setupTimer = null;
+  }
+  if (room.setupTimerInterval) {
+    clearInterval(room.setupTimerInterval);
+    room.setupTimerInterval = null;
+  }
+}
+
 function startTurnTimer(room: RoomState): void {
   if (room.timerMode === 'none') return;
   clearTurnTimer(room);
@@ -113,12 +230,28 @@ function startTurnTimer(room: RoomState): void {
     const winner = loser === 'white' ? 'black' : 'white';
     endGame(room, winner, `${loser === 'white' ? 'White' : 'Black'} ran out of time!`);
   }, duration);
+
+  // Start a 1-second interval to broadcast timer updates
+  if (!room.timerInterval) {
+    room.timerInterval = setInterval(() => {
+      if (room.phase !== 'playing') {
+        if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
+        return;
+      }
+      const timers = getRemainingTime(room);
+      io.to(room.roomId).emit('timerUpdate', { white: timers.white, black: timers.black });
+    }, 1000);
+  }
 }
 
 function clearTurnTimer(room: RoomState): void {
   if (room.turnTimer) {
     clearTimeout(room.turnTimer);
     room.turnTimer = null;
+  }
+  if (room.timerInterval) {
+    clearInterval(room.timerInterval);
+    room.timerInterval = null;
   }
 }
 
@@ -127,9 +260,9 @@ function getRemainingTime(room: RoomState): { white: number; black: number } {
   const duration = TIMER_DURATIONS[room.timerMode];
   const elapsed = room.turnStartedAt ? Date.now() - room.turnStartedAt : 0;
   if (room.currentPlayer === 'white') {
-    return { white: Math.max(0, duration - elapsed), black: duration };
+    return { white: Math.max(0, duration - elapsed), black: room.timerBlack };
   } else {
-    return { white: duration, black: Math.max(0, duration - elapsed) };
+    return { white: room.timerWhite, black: Math.max(0, duration - elapsed) };
   }
 }
 
@@ -231,8 +364,12 @@ function createMatchRoom(a: MatchRequest, b: MatchRequest, timerMode: TimerMode)
     timerBlack: TIMER_DURATIONS[timerMode],
     turnStartedAt: null,
     turnTimer: null,
+    timerInterval: null,
     isCustom: false,
     lobbyCode: null,
+    setupTimer: null,
+    setupTimerInterval: null,
+    setupStartedAt: null,
   };
 
   rooms.set(roomId, room);
@@ -250,6 +387,7 @@ function createMatchRoom(a: MatchRequest, b: MatchRequest, timerMode: TimerMode)
 
   // Start setup phase
   io.to(roomId).emit('setupPhase');
+  startSetupTimer(room);
 }
 
 function saveReplay(room: RoomState): string {
@@ -275,6 +413,7 @@ function endGame(room: RoomState, winner: 'white' | 'black', reason: string): vo
   room.winReason = reason;
   room.phase = 'gameover';
   clearTurnTimer(room);
+  clearSetupTimer(room);
 
   const replayId = saveReplay(room);
 
@@ -398,8 +537,12 @@ io.on('connection', (socket) => {
       timerBlack: TIMER_DURATIONS[timerMode],
       turnStartedAt: null,
       turnTimer: null,
+      timerInterval: null,
       isCustom: true,
       lobbyCode: code,
+      setupTimer: null,
+      setupTimerInterval: null,
+      setupStartedAt: null,
     };
 
     rooms.set(roomId, room);
@@ -438,6 +581,7 @@ io.on('connection', (socket) => {
       io.sockets.sockets.get(room.white.socketId)?.emit('opponentJoined', { opponent: user.username, opponentElo: user.elo });
     }
     io.to(roomId).emit('setupPhase');
+    startSetupTimer(room);
   });
 
   // ─── Legacy room ───
@@ -466,8 +610,12 @@ io.on('connection', (socket) => {
       timerBlack: TIMER_DURATIONS[timerMode],
       turnStartedAt: null,
       turnTimer: null,
+      timerInterval: null,
       isCustom: false,
       lobbyCode: null,
+      setupTimer: null,
+      setupTimerInterval: null,
+      setupStartedAt: null,
     };
 
     rooms.set(roomId, room);
@@ -501,6 +649,7 @@ io.on('connection', (socket) => {
       io.sockets.sockets.get(room.white.socketId)?.emit('opponentJoined', { opponent: user.username, opponentElo: user.elo });
     }
     io.to(roomId).emit('setupPhase');
+    startSetupTimer(room);
   });
 
   socket.on('joinAsArbiter', ({ roomId }) => {
@@ -549,8 +698,27 @@ io.on('connection', (socket) => {
 
     // If both ready, start game
     if (room.setupDone.white && room.setupDone.black) {
+      clearSetupTimer(room);
       room.phase = 'playing';
       room.currentPlayer = 'white';
+
+      // Send opponent piece positions (without ranks) to each player
+      const whiteSocket = room.white?.socketId ? io.sockets.sockets.get(room.white.socketId) : null;
+      const blackSocket = room.black?.socketId ? io.sockets.sockets.get(room.black.socketId) : null;
+
+      // White receives black's piece positions (no ranks)
+      if (whiteSocket) {
+        whiteSocket.emit('opponentPieces', {
+          pieces: room.blackPieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+        });
+      }
+      // Black receives white's piece positions (no ranks)
+      if (blackSocket) {
+        blackSocket.emit('opponentPieces', {
+          pieces: room.whitePieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+        });
+      }
+
       io.to(roomId).emit('gameStart', { currentPlayer: 'white', timerMode: room.timerMode });
       startTurnTimer(room);
     }
