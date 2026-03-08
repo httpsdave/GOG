@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 
 export default function LoginPage() {
-  const { user, signInWithGoogle, signInWithEmail, mfaResolver, resolveMfa, mfaError } = useAuth();
+  const { user, signInWithGoogle, signInWithEmail, mfaResolver, resolveMfa, mfaError, authError } = useAuth();
   const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -114,6 +114,7 @@ export default function LoginPage() {
             </svg>
             Continue with Google
           </button>
+          {authError && <p className="text-red-400 text-sm">{authError}</p>}
 
           <div className="flex items-center gap-3">
             <div className="h-px flex-1 bg-[#1a2535]" />

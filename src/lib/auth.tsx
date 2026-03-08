@@ -40,6 +40,7 @@ interface AuthContextType {
   signUpWithEmail: (email: string, password: string, username: string) => Promise<void>;
   logout: () => Promise<void>;
   getIdToken: () => Promise<string | null>;
+  authError: string | null;
   // 2FA
   enrollTotp: () => Promise<TotpSecret | null>;
   verifyTotpEnrollment: (secret: TotpSecret, code: string) => Promise<boolean>;
@@ -79,6 +80,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [mfaResolver, setMfaResolver] = useState<MultiFactorResolver | null>(null);
   const [mfaError, setMfaError] = useState<string | null>(null);
 
@@ -97,15 +99,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Handle redirect result from Google sign-in on return from Google's OAuth page
     getRedirectResult(auth).then(async (result) => {
       if (result?.user) {
+        setAuthError(null);
         await ensureUserProfile(result.user);
       }
     }).catch((err: unknown) => {
-      handleMfaError(err);
+      if (!handleMfaError(err)) {
+        const e = err as { code?: string; message?: string };
+        setAuthError(e.code ? `${e.code}: ${e.message || ''}`.trim() : 'Google sign-in redirect failed');
+      }
     });
 
     const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
+        setAuthError(null);
         const p = await ensureUserProfile(u);
         setProfile(p);
       } else {
@@ -118,6 +125,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signInWithGoogle = async () => {
+    setAuthError(null);
     await signInWithRedirect(auth, googleProvider);
     // Page will navigate away; result is handled in useEffect via getRedirectResult
   };
@@ -139,6 +147,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = async () => {
     await signOut(auth);
     setProfile(null);
+    setAuthError(null);
     setMfaResolver(null);
     setMfaError(null);
   };
@@ -178,6 +187,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return (
     <AuthContext.Provider value={{
       user, profile, loading,
+      authError,
       signInWithGoogle, signInWithEmail, signUpWithEmail, logout, getIdToken,
       enrollTotp, verifyTotpEnrollment, resolveMfa,
       mfaResolver, mfaError,
