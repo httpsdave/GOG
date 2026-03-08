@@ -86,6 +86,7 @@ export default function GameBoard() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [revealAll, setRevealAll] = useState(false);
   const [showGameOverModal, setShowGameOverModal] = useState(false);
+  const [previewThemeId, setPreviewThemeId] = useState<ThemeId | null>(null);
   const aiThinking = useRef(false);
 
   const theme = THEMES[themeId];
@@ -441,12 +442,12 @@ export default function GameBoard() {
             <div className="space-y-3">
               <div className="bg-[#0d1520]/60 border border-[#1a2744] rounded-xl p-5">
                 <p className="text-[#c8a951]/80 text-[10px] tracking-[0.2em] uppercase font-medium mb-4">Board Theme</p>
-                <div className="flex gap-2 flex-wrap">
+                <div className="grid grid-cols-2 gap-2">
                   {(Object.keys(THEMES) as ThemeId[]).map((tid) => (
                     <button
                       key={tid}
-                      onClick={() => { setThemeId(tid); sounds?.click(); }}
-                      className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                      onClick={() => { setPreviewThemeId(tid); sounds?.click(); }}
+                      className={`px-4 py-2.5 rounded-lg text-sm font-medium transition-all text-center ${
                         tid === themeId
                           ? 'bg-[#c8a951] text-[#0a0f1a] shadow-lg shadow-[#c8a951]/20'
                           : 'bg-[#111b2e] text-[#8a9ab5] border border-[#1e2d4a] hover:border-[#c8a951]/40 hover:text-[#c8a951]'
@@ -473,6 +474,16 @@ export default function GameBoard() {
         <footer className="relative text-center py-6 border-t border-[#111b2e]">
           <p className="text-[#2a3a5c] text-sm">Game of the Generals — Salpakan</p>
         </footer>
+
+        {/* Theme preview modal */}
+        {previewThemeId && (
+          <ThemePreviewModal
+            themeId={previewThemeId}
+            activeThemeId={themeId}
+            onSelect={(id) => { setThemeId(id); sounds?.click(); }}
+            onClose={() => setPreviewThemeId(null)}
+          />
+        )}
       </div>
     );
   }
@@ -711,6 +722,147 @@ function MoveHistoryList({ moves, theme, playerSide }: { moves: GameState['moveH
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ─── Theme board preview (static mini-board) ───
+function ThemeBoardPreview({ t }: { t: BoardTheme }) {
+  const COLS = 9;
+  const ROWS = 8;
+  const SQ = 40;
+  const LABEL = 20;
+
+  // Representative pieces: top rows = opponent (black), bottom rows = player (white)
+  const blackPieces: [number, number][] = [
+    [7,0],[7,2],[7,4],[7,6],[7,8],
+    [6,1],[6,3],[6,5],[6,7],
+    [5,0],[5,3],[5,6],
+  ];
+  const whitePieces: [number, number][] = [
+    [0,0],[0,2],[0,4],[0,6],[0,8],
+    [1,1],[1,3],[1,5],[1,7],
+    [2,2],[2,4],[2,7],
+  ];
+  const pw = Math.round(SQ * 0.72);
+  const ph = Math.round(SQ * 0.52);
+
+  return (
+    <div className={`${t.boardBorder} border-2 rounded-lg overflow-hidden relative inline-block shadow-2xl`}>
+      {t.boardOverlayStyle && (
+        <div className={`absolute inset-0 pointer-events-none z-10 ${t.boardOverlayOpacity ?? 'opacity-[0.25]'}`} style={t.boardOverlayStyle} />
+      )}
+      {/* Column labels */}
+      <div style={{ display: 'flex' }}>
+        <div style={{ width: LABEL, height: LABEL, flexShrink: 0 }} />
+        {COLUMN_LABELS.map((l) => (
+          <div key={l} style={{ width: SQ, height: LABEL, flexShrink: 0 }} className={`flex items-center justify-center ${t.labelColor} text-[10px] font-mono`}>{l}</div>
+        ))}
+      </div>
+      {/* Rows */}
+      {Array.from({ length: ROWS }).map((_, vr) => {
+        const lr = ROWS - 1 - vr;
+        return (
+          <div key={vr} style={{ display: 'flex' }}>
+            <div style={{ width: LABEL, height: SQ, flexShrink: 0 }} className={`flex items-center justify-center ${t.labelColor} text-[10px] font-mono`}>{lr + 1}</div>
+            {Array.from({ length: COLS }).map((_, c) => {
+              const bg = (lr + c) % 2 === 0 ? t.lightSquare : t.darkSquare;
+              const isBlack = blackPieces.some(([r, col]) => r === lr && col === c);
+              const isWhite = whitePieces.some(([r, col]) => r === lr && col === c);
+              const inSetup = lr <= 2;
+              return (
+                <div
+                  key={c}
+                  style={{ width: SQ, height: SQ, flexShrink: 0 }}
+                  className={`${bg} flex items-center justify-center ${inSetup ? 'ring-inset' : ''}`}
+                >
+                  {isBlack && <div className={`${t.blackPieceBg} ${t.blackPieceBorder} border rounded-sm`} style={{ width: pw, height: ph }} />}
+                  {isWhite && <div className={`${t.whitePieceBg} ${t.whitePieceBorder} border rounded-sm`} style={{ width: pw, height: ph }} />}
+                  {!isBlack && !isWhite && inSetup && (
+                    <div className="w-1.5 h-1.5 rounded-full bg-[#c8a951]/20" />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Theme preview modal ───
+function ThemePreviewModal({
+  themeId,
+  activeThemeId,
+  onSelect,
+  onClose,
+}: {
+  themeId: ThemeId;
+  activeThemeId: ThemeId;
+  onSelect: (id: ThemeId) => void;
+  onClose: () => void;
+}) {
+  const t = THEMES[themeId];
+  const isActive = themeId === activeThemeId;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm animate-fade-in p-4"
+      onClick={onClose}
+    >
+      <div
+        className={`${t.panelBg} ${t.panelBorder} border rounded-2xl p-5 sm:p-6 w-full max-w-fit mx-auto shadow-2xl animate-bounce-in overflow-auto max-h-[92vh]`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between mb-4 gap-6">
+          <div>
+            <h3 className={`${t.headerColor} font-display text-xl`}>{t.name}</h3>
+            <p className={`${t.panelTextMuted} text-xs mt-1`}>{t.description}</p>
+          </div>
+          <button onClick={onClose} className={`${t.panelTextMuted} hover:text-white transition-colors mt-0.5 flex-shrink-0`}>
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+          </button>
+        </div>
+
+        {/* Board preview */}
+        <div className="mb-5 overflow-x-auto">
+          <ThemeBoardPreview t={t} />
+        </div>
+
+        {/* Legend */}
+        <div className={`flex items-center gap-4 mb-5 px-1 text-xs ${t.panelTextMuted}`}>
+          <span className="flex items-center gap-1.5">
+            <span className={`inline-block w-6 h-4 rounded-sm border ${t.blackPieceBg} ${t.blackPieceBorder}`} />
+            Opponent
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className={`inline-block w-6 h-4 rounded-sm border ${t.whitePieceBg} ${t.whitePieceBorder}`} />
+            Your pieces
+          </span>
+        </div>
+
+        {/* Actions */}
+        <div className="flex gap-3">
+          <button
+            onClick={() => { onSelect(themeId); onClose(); }}
+            className={`flex-1 py-2.5 rounded-xl text-sm font-bold transition-all ${
+              isActive
+                ? 'border-2 border-[#c8a951] text-[#c8a951] bg-[#c8a951]/10'
+                : `${t.accentPrimary} text-white hover:brightness-110`
+            }`}
+          >
+            {isActive ? '✓ Currently Selected' : 'Use This Theme'}
+          </button>
+          <button
+            onClick={onClose}
+            className={`px-5 py-2.5 rounded-xl text-sm ${t.panelBorder} border ${t.panelTextMuted} hover:brightness-125 transition-all`}
+          >
+            Close
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
