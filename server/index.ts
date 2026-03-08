@@ -141,6 +141,8 @@ function startSetupTimer(room: RoomState): void {
   clearSetupTimer(room);
   room.setupStartedAt = Date.now();
 
+  io.to(room.roomId).emit('setupTimerUpdate', { remaining: Math.ceil(SETUP_DURATION / 1000) });
+
   // Emit countdown every second
   room.setupTimerInterval = setInterval(() => {
     if (room.phase !== 'setup' || !room.setupStartedAt) {
@@ -230,6 +232,9 @@ function startTurnTimer(room: RoomState): void {
     const winner = loser === 'white' ? 'black' : 'white';
     endGame(room, winner, `${loser === 'white' ? 'White' : 'Black'} ran out of time!`);
   }, duration);
+
+  const initialTimers = getRemainingTime(room);
+  io.to(room.roomId).emit('timerUpdate', { white: initialTimers.white, black: initialTimers.black });
 
   // Start a 1-second interval to broadcast timer updates
   if (!room.timerInterval) {
