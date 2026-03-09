@@ -200,7 +200,25 @@ function startSetupTimer(room: RoomState): void {
       });
     }
 
-    io.to(room.roomId).emit('gameStart', { currentPlayer: 'white', timerMode: room.timerMode });
+    const timers = getTimerSeconds(room);
+    if (whiteSocket) {
+      whiteSocket.emit('gameStart', {
+        currentPlayer: 'white',
+        timerMode: room.timerMode,
+        opponentPieces: room.blackPieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+        timerWhite: timers.white,
+        timerBlack: timers.black,
+      });
+    }
+    if (blackSocket) {
+      blackSocket.emit('gameStart', {
+        currentPlayer: 'white',
+        timerMode: room.timerMode,
+        opponentPieces: room.whitePieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+        timerWhite: timers.white,
+        timerBlack: timers.black,
+      });
+    }
     startTurnTimer(room);
   }, SETUP_DURATION);
 }
@@ -482,6 +500,50 @@ io.on('connection', (socket) => {
       }
       socketToUser.set(socket.id, { uid: decoded.uid, username: profile.username, elo: profile.elo });
       socket.emit('authenticated', { uid: decoded.uid, username: profile.username, elo: profile.elo });
+
+      // Check for reconnection — find any active room this user belongs to
+      for (const [roomId, room] of rooms) {
+        if (room.phase !== 'playing' && room.phase !== 'setup') continue;
+        const isWhite = room.white?.uid === decoded.uid;
+        const isBlack = room.black?.uid === decoded.uid;
+        if (!isWhite && !isBlack) continue;
+
+        // Reconnect: update socket references
+        const color = isWhite ? 'white' : 'black';
+        const player = isWhite ? room.white! : room.black!;
+        const oldSocketId = player.socketId;
+        player.socketId = socket.id;
+        player.connected = true;
+        socketToRoom.set(socket.id, roomId);
+        socketToRoom.delete(oldSocketId);
+        socket.join(roomId);
+
+        const opponent = isWhite ? room.black : room.white;
+        const myPieces = isWhite ? room.whitePieces : room.blackPieces;
+        const oppPieces = isWhite ? room.blackPieces : room.whitePieces;
+        const timers = getTimerSeconds(room);
+
+        socket.emit('fullGameState', {
+          phase: room.phase,
+          color,
+          opponent: opponent?.username || 'Unknown',
+          opponentElo: opponent?.elo || 1200,
+          opponentPieces: oppPieces.filter(p => !p.isEliminated && p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+          myPieces: myPieces.filter(p => !p.isEliminated && p.row != null && p.col != null).map(p => ({ id: p.id, rank: p.rank, row: p.row!, col: p.col! })),
+          currentPlayer: room.currentPlayer,
+          timerMode: room.timerMode,
+          timerWhite: timers.white,
+          timerBlack: timers.black,
+          turnCount: room.turnCount,
+        });
+
+        // Notify opponent
+        if (opponent?.socketId) {
+          io.sockets.sockets.get(opponent.socketId)?.emit('opponentReconnected');
+        }
+
+        break;
+      }
     } catch {
       socket.emit('authError', { message: 'Invalid authentication token' });
     }
@@ -730,7 +792,25 @@ io.on('connection', (socket) => {
         });
       }
 
-      io.to(roomId).emit('gameStart', { currentPlayer: 'white', timerMode: room.timerMode });
+      const timers = getTimerSeconds(room);
+      if (whiteSocket) {
+        whiteSocket.emit('gameStart', {
+          currentPlayer: 'white',
+          timerMode: room.timerMode,
+          opponentPieces: room.blackPieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+          timerWhite: timers.white,
+          timerBlack: timers.black,
+        });
+      }
+      if (blackSocket) {
+        blackSocket.emit('gameStart', {
+          currentPlayer: 'white',
+          timerMode: room.timerMode,
+          opponentPieces: room.whitePieces.filter(p => p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+          timerWhite: timers.white,
+          timerBlack: timers.black,
+        });
+      }
       startTurnTimer(room);
     }
   });

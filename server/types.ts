@@ -130,7 +130,7 @@ export interface ServerToClientEvents {
   setupTimerUpdate: (data: { remaining: number }) => void;
   opponentPieces: (data: { pieces: { id: string; row: number; col: number }[] }) => void;
   autoDeployed: (data: { pieces: { id: string; rank: string; row: number; col: number }[] }) => void;
-  gameStart: (data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode }) => void;
+  gameStart: (data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode; opponentPieces: { id: string; row: number; col: number }[]; timerWhite: number; timerBlack: number }) => void;
   moveMade: (data: {
     pieceId: string;
     fromRow: number;
@@ -164,4 +164,17 @@ export interface ServerToClientEvents {
   replayData: (data: ReplayData) => void;
   playerInfo: (data: { elo: number; username: string }) => void;
   leaderboard: (data: { players: Array<{ username: string; elo: number; wins: number; losses: number; rank: number }> }) => void;
+  fullGameState: (data: {
+    phase: 'setup' | 'playing' | 'gameover';
+    color: 'white' | 'black';
+    opponent: string;
+    opponentElo: number;
+    opponentPieces: { id: string; row: number; col: number }[];
+    myPieces: { id: string; rank: string; row: number; col: number }[];
+    currentPlayer: 'white' | 'black';
+    timerMode: TimerMode;
+    timerWhite: number;
+    timerBlack: number;
+    turnCount: number;
+  }) => void;
 }

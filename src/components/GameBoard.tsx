@@ -185,6 +185,7 @@ export default function GameBoard() {
       'moveMade',
       'opponentDisconnected',
       'opponentReconnected',
+      'fullGameState',
     ] as const;
     listenerEvents.forEach((eventName) => s.off(eventName as never));
 
@@ -265,12 +266,30 @@ export default function GameBoard() {
       });
     }) as never);
 
-    s.on('gameStart' as never, ((data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode }) => {
+    s.on('gameStart' as never, ((data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode; opponentPieces?: { id: string; row: number; col: number }[]; timerWhite?: number; timerBlack?: number }) => {
       setOnlineTimerMode(data.timerMode);
       const startSeconds = TIMER_SECONDS[data.timerMode] ?? 0;
-      setOnlineTimerWhite(startSeconds);
-      setOnlineTimerBlack(startSeconds);
-      setGameState(prev => ({ ...prev, phase: GamePhase.Playing, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black }));
+      setOnlineTimerWhite(data.timerWhite ?? startSeconds);
+      setOnlineTimerBlack(data.timerBlack ?? startSeconds);
+      setGameState(prev => {
+        let pieces = prev.pieces;
+        // Atomically place opponent pieces from the gameStart payload
+        if (data.opponentPieces && data.opponentPieces.length > 0) {
+          const mySide = playerSideRef.current;
+          const opponentOwner = mySide === Player.White ? Player.Black : Player.White;
+          const oppPiecesList = prev.pieces.filter(p => p.owner === opponentOwner);
+          pieces = prev.pieces.map(p => {
+            if (p.owner !== opponentOwner) return p;
+            const idx = oppPiecesList.indexOf(p);
+            if (idx >= 0 && idx < data.opponentPieces!.length) {
+              const sp = data.opponentPieces![idx];
+              return { ...p, id: sp.id, position: { row: sp.row, col: sp.col } };
+            }
+            return p;
+          });
+        }
+        return { ...prev, pieces, phase: GamePhase.Playing, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black };
+      });
     }) as never);
 
     s.on('opponentReady' as never, (() => {
@@ -383,7 +402,75 @@ export default function GameBoard() {
     s.on('opponentReconnected' as never, (() => {
       setOnlineError('');
     }) as never);
+
+    s.on('fullGameState' as never, ((data: {
+      phase: 'setup' | 'playing' | 'gameover';
+      color: 'white' | 'black';
+      opponent: string;
+      opponentElo: number;
+      opponentPieces: { id: string; row: number; col: number }[];
+      myPieces: { id: string; rank: string; row: number; col: number }[];
+      currentPlayer: 'white' | 'black';
+      timerMode: TimerMode;
+      timerWhite: number;
+      timerBlack: number;
+      turnCount: number;
+    }) => {
+      const nextSide = data.color === 'white' ? Player.White : Player.Black;
+      playerSideRef.current = nextSide;
+      setPlayerSide(nextSide);
+      setOpponentName(data.opponent);
+      setOpponentElo(data.opponentElo);
+      setOnlineTimerMode(data.timerMode);
+      setOnlineTimerWhite(data.timerWhite);
+      setOnlineTimerBlack(data.timerBlack);
+      setMode('online');
+      if (queueInterval.current) { clearInterval(queueInterval.current); queueInterval.current = null; }
+
+      // Rebuild full game state from server data
+      setGameState(prev => {
+        const pieces = prev.pieces.map(p => {
+          if (p.owner === nextSide) {
+            // My pieces — match by rank and assign server positions
+            const match = data.myPieces.find(sp => sp.id === p.id) ||
+              data.myPieces.find(sp => sp.rank === (p.rank as string) && !prev.pieces.some(
+                existing => existing.id === sp.id && existing !== p
+              ));
+            if (match) {
+              return { ...p, id: match.id, position: { row: match.row, col: match.col }, isEliminated: false };
+            }
+            return { ...p, position: null, isEliminated: true };
+          } else {
+            // Opponent pieces — positions only
+            const opponentOwner = nextSide === Player.White ? Player.Black : Player.White;
+            const oppPiecesList = prev.pieces.filter(pp => pp.owner === opponentOwner);
+            const idx = oppPiecesList.indexOf(p);
+            if (idx >= 0 && idx < data.opponentPieces.length) {
+              const sp = data.opponentPieces[idx];
+              return { ...p, id: sp.id, position: { row: sp.row, col: sp.col }, isEliminated: false };
+            }
+            return { ...p, position: null, isEliminated: true };
+          }
+        });
+        const phase = data.phase === 'playing' ? GamePhase.Playing : data.phase === 'setup' ? GamePhase.Setup : GamePhase.GameOver;
+        return { ...prev, pieces, phase, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, turnCount: data.turnCount };
+      });
+    }) as never);
   }, [user, getIdToken, sounds]);
+
+  // ── Client-side timer countdown (smooth local updates between server pushes) ──
+  useEffect(() => {
+    if (mode !== 'online' || gameState.phase !== GamePhase.Playing || onlineTimerMode === 'none') return;
+    const interval = setInterval(() => {
+      const isWhiteTurn = gameState.currentPlayer === Player.White;
+      if (isWhiteTurn) {
+        setOnlineTimerWhite(prev => Math.max(0, prev - 1));
+      } else {
+        setOnlineTimerBlack(prev => Math.max(0, prev - 1));
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [mode, gameState.phase, gameState.currentPlayer, onlineTimerMode]);
 
   // ── Queue timer counter ──
   useEffect(() => {
