@@ -233,7 +233,7 @@ function startTurnTimer(room: RoomState): void {
     endGame(room, winner, `${loser === 'white' ? 'White' : 'Black'} ran out of time!`);
   }, duration);
 
-  const initialTimers = getRemainingTime(room);
+  const initialTimers = getTimerSeconds(room);
   io.to(room.roomId).emit('timerUpdate', { white: initialTimers.white, black: initialTimers.black });
 
   // Start a 1-second interval to broadcast timer updates
@@ -243,7 +243,7 @@ function startTurnTimer(room: RoomState): void {
         if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
         return;
       }
-      const timers = getRemainingTime(room);
+      const timers = getTimerSeconds(room);
       io.to(room.roomId).emit('timerUpdate', { white: timers.white, black: timers.black });
     }, 1000);
   }
@@ -269,6 +269,12 @@ function getRemainingTime(room: RoomState): { white: number; black: number } {
   } else {
     return { white: room.timerWhite, black: Math.max(0, duration - elapsed) };
   }
+}
+
+/** Convert ms timer values to seconds for client emission */
+function getTimerSeconds(room: RoomState): { white: number; black: number } {
+  const ms = getRemainingTime(room);
+  return { white: Math.ceil(ms.white / 1000), black: Math.ceil(ms.black / 1000) };
 }
 
 // ─── Firestore helpers ───
@@ -862,7 +868,7 @@ io.on('connection', (socket) => {
       startTurnTimer(room);
     }
 
-    const timers = getRemainingTime(room);
+    const timers = getTimerSeconds(room);
 
     // Emit to players (they don't see opponent ranks)
     const moveEvent = {

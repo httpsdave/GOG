@@ -33,12 +33,6 @@ type TimerMode = 'none' | '30s' | '1m' | '2m';
 const TIMER_LABELS: Record<TimerMode, string> = { 'none': 'No Timer', '30s': '30 seconds', '1m': '1 minute', '2m': '2 minutes' };
 const TIMER_SECONDS: Record<TimerMode, number> = { 'none': 0, '30s': 30, '1m': 60, '2m': 120 };
 
-function normalizeTimerSeconds(value: number): number {
-  if (!Number.isFinite(value) || value <= 0) return 0;
-  // Server timers are expected in ms; keep this tolerant to seconds payloads.
-  return value > 1000 ? Math.ceil(value / 1000) : Math.ceil(value);
-}
-
 // ─── Icon mapping (each image is 250×76 with white side on left, black on right) ───
 const RANK_ICON: Record<Rank, string> = {
   [Rank.FiveStarGeneral]: '/icons/5star.jpg',
@@ -258,16 +252,12 @@ export default function GameBoard() {
       setGameState(prev => {
         const mySide = playerSideRef.current;
         const myPieces = prev.pieces.filter(p => p.owner === mySide);
-        const byId = new Map(data.pieces.map(p => [p.id, p]));
         const updatedPieces = prev.pieces.map(p => {
           if (p.owner !== mySide) return p;
-          const exact = byId.get(p.id);
-          if (exact) {
-            return { ...p, id: exact.id, position: { row: exact.row, col: exact.col } };
-          }
           const idx = myPieces.indexOf(p);
           if (idx >= 0 && idx < data.pieces.length) {
-            return { ...p, id: data.pieces[idx].id, position: { row: data.pieces[idx].row, col: data.pieces[idx].col } };
+            const serverPiece = data.pieces[idx];
+            return { ...p, id: serverPiece.id, position: { row: serverPiece.row, col: serverPiece.col } };
           }
           return p;
         });
@@ -293,17 +283,15 @@ export default function GameBoard() {
         const mySide = playerSideRef.current;
         const opponentOwner = mySide === Player.White ? Player.Black : Player.White;
         const opponentPieces = prev.pieces.filter(p => p.owner === opponentOwner);
-        const byId = new Map(data.pieces.map(p => [p.id, { row: p.row, col: p.col }]));
-        // Map server piece IDs to local pieces (by index, since both are ordered the same way)
+
+        // Primary: index-based mapping (both clients create pieces in same PIECE_COUNTS order)
+        // Also assign server IDs so moveMade can find them later
         const updatedPieces = prev.pieces.map(p => {
           if (p.owner !== opponentOwner) return p;
-          const exact = byId.get(p.id);
-          if (exact) {
-            return { ...p, position: { row: exact.row, col: exact.col } };
-          }
           const idx = opponentPieces.indexOf(p);
           if (idx >= 0 && idx < data.pieces.length) {
-            return { ...p, id: data.pieces[idx].id, position: { row: data.pieces[idx].row, col: data.pieces[idx].col } };
+            const serverPiece = data.pieces[idx];
+            return { ...p, id: serverPiece.id, position: { row: serverPiece.row, col: serverPiece.col } };
           }
           return p;
         });
@@ -323,8 +311,8 @@ export default function GameBoard() {
     }) as never);
 
     s.on('timerUpdate' as never, ((data: { white: number; black: number }) => {
-      setOnlineTimerWhite(normalizeTimerSeconds(data.white));
-      setOnlineTimerBlack(normalizeTimerSeconds(data.black));
+      setOnlineTimerWhite(data.white);
+      setOnlineTimerBlack(data.black);
     }) as never);
 
     s.on('moveMade' as never, ((data: { pieceId: string; fromRow: number; fromCol: number; toRow: number; toCol: number; challenge?: { result: string; eliminatedPieceIds: string[] }; currentPlayer: 'white' | 'black'; turnCount: number; timerWhite: number; timerBlack: number }) => {
@@ -338,8 +326,8 @@ export default function GameBoard() {
       } else {
         sounds?.move();
       }
-      setOnlineTimerWhite(normalizeTimerSeconds(data.timerWhite));
-      setOnlineTimerBlack(normalizeTimerSeconds(data.timerBlack));
+      setOnlineTimerWhite(data.timerWhite);
+      setOnlineTimerBlack(data.timerBlack);
       setGameState(prev => {
         let pieces = [...prev.pieces];
         const movingPiece = pieces.find(p => p.id === data.pieceId);
@@ -351,7 +339,7 @@ export default function GameBoard() {
             if (defender) {
               pieces = pieces.map(p => {
                 if (p.id === data.pieceId) return { ...p, position: to };
-                if (p.id === defender.id) return { ...p, position: null, isAlive: false };
+                if (p.id === defender.id) return { ...p, position: null, isEliminated: true };
                 return p;
               });
               const elimKey = defender.owner === Player.White ? 'white' : 'black';
@@ -359,7 +347,7 @@ export default function GameBoard() {
             }
           } else if (result === 'defender_wins') {
             pieces = pieces.map(p => {
-              if (p.id === data.pieceId) return { ...p, position: null, isAlive: false };
+              if (p.id === data.pieceId) return { ...p, position: null, isEliminated: true };
               return p;
             });
             const elimKey = movingPiece.owner === Player.White ? 'white' : 'black';
@@ -369,8 +357,8 @@ export default function GameBoard() {
             const defender = getPieceAtPosition(pieces, to);
             if (defender) {
               pieces = pieces.map(p => {
-                if (p.id === data.pieceId) return { ...p, position: null, isAlive: false };
-                if (p.id === defender.id) return { ...p, position: null, isAlive: false };
+                if (p.id === data.pieceId) return { ...p, position: null, isEliminated: true };
+                if (p.id === defender.id) return { ...p, position: null, isEliminated: true };
                 return p;
               });
               const atkKey = movingPiece.owner === Player.White ? 'white' : 'black';
@@ -395,7 +383,7 @@ export default function GameBoard() {
     s.on('opponentReconnected' as never, (() => {
       setOnlineError('');
     }) as never);
-  }, [user, getIdToken, playerSide, sounds]);
+  }, [user, getIdToken, sounds]);
 
   // ── Queue timer counter ──
   useEffect(() => {
@@ -527,7 +515,7 @@ export default function GameBoard() {
       const myPieces = gameState.pieces.filter(p => p.owner === playerSide && p.position);
       const pieces = myPieces.map(p => ({
         id: p.id,
-        rank: RANK_SHORT[p.rank],
+        rank: p.rank as string,
         owner: (p.owner === Player.White ? 'white' : 'black') as 'white' | 'black',
         row: p.position!.row,
         col: p.position!.col,
