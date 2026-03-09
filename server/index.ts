@@ -250,31 +250,12 @@ function startTurnTimer(room: RoomState): void {
     const winner = loser === 'white' ? 'black' : 'white';
     endGame(room, winner, `${loser === 'white' ? 'White' : 'Black'} ran out of time!`);
   }, duration);
-
-  const initialTimers = getTimerSeconds(room);
-  io.to(room.roomId).emit('timerUpdate', { white: initialTimers.white, black: initialTimers.black });
-
-  // Start a 1-second interval to broadcast timer updates
-  if (!room.timerInterval) {
-    room.timerInterval = setInterval(() => {
-      if (room.phase !== 'playing') {
-        if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
-        return;
-      }
-      const timers = getTimerSeconds(room);
-      io.to(room.roomId).emit('timerUpdate', { white: timers.white, black: timers.black });
-    }, 1000);
-  }
 }
 
 function clearTurnTimer(room: RoomState): void {
   if (room.turnTimer) {
     clearTimeout(room.turnTimer);
     room.turnTimer = null;
-  }
-  if (room.timerInterval) {
-    clearInterval(room.timerInterval);
-    room.timerInterval = null;
   }
 }
 

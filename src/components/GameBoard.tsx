@@ -249,17 +249,14 @@ export default function GameBoard() {
     }) as never);
 
     s.on('autoDeployed' as never, ((data: { pieces: { id: string; rank: string; row: number; col: number }[] }) => {
-      // Server auto-deployed our pieces — update local game state
+      // Server auto-deployed our pieces — update local game state via ID matching
       setGameState(prev => {
         const mySide = playerSideRef.current;
-        const myPieces = prev.pieces.filter(p => p.owner === mySide);
+        const serverMap = new Map(data.pieces.map(sp => [sp.id, sp]));
         const updatedPieces = prev.pieces.map(p => {
           if (p.owner !== mySide) return p;
-          const idx = myPieces.indexOf(p);
-          if (idx >= 0 && idx < data.pieces.length) {
-            const serverPiece = data.pieces[idx];
-            return { ...p, id: serverPiece.id, position: { row: serverPiece.row, col: serverPiece.col } };
-          }
+          const sp = serverMap.get(p.id);
+          if (sp) return { ...p, position: { row: sp.row, col: sp.col } };
           return p;
         });
         return { ...prev, pieces: updatedPieces };
@@ -268,19 +265,28 @@ export default function GameBoard() {
 
     s.on('gameStart' as never, ((data: { currentPlayer: 'white' | 'black'; timerMode: TimerMode; opponentPieces?: { id: string; row: number; col: number }[]; timerWhite?: number; timerBlack?: number }) => {
       setOnlineTimerMode(data.timerMode);
-      const startSeconds = TIMER_SECONDS[data.timerMode] ?? 0;
-      setOnlineTimerWhite(data.timerWhite ?? startSeconds);
-      setOnlineTimerBlack(data.timerBlack ?? startSeconds);
+      const maxSeconds = TIMER_SECONDS[data.timerMode] ?? 120;
+      // Cap timer values to prevent ms-as-seconds bugs
+      const capTimer = (v: number | undefined) => v != null ? Math.min(v, maxSeconds) : maxSeconds;
+      setOnlineTimerWhite(capTimer(data.timerWhite));
+      setOnlineTimerBlack(capTimer(data.timerBlack));
       setGameState(prev => {
         let pieces = prev.pieces;
-        // Atomically place opponent pieces from the gameStart payload
+        // Place opponent pieces from the gameStart payload using ID-based mapping
         if (data.opponentPieces && data.opponentPieces.length > 0) {
           const mySide = playerSideRef.current;
           const opponentOwner = mySide === Player.White ? Player.Black : Player.White;
-          const oppPiecesList = prev.pieces.filter(p => p.owner === opponentOwner);
+          // Build a map of server ID → position
+          const serverMap = new Map(data.opponentPieces.map(sp => [sp.id, sp]));
+          // Also build ordered list for fallback index mapping
+          const oppLocal = prev.pieces.filter(p => p.owner === opponentOwner);
           pieces = prev.pieces.map(p => {
             if (p.owner !== opponentOwner) return p;
-            const idx = oppPiecesList.indexOf(p);
+            // Try ID match first
+            const byId = serverMap.get(p.id);
+            if (byId) return { ...p, id: byId.id, position: { row: byId.row, col: byId.col } };
+            // Fallback: index-based
+            const idx = oppLocal.indexOf(p);
             if (idx >= 0 && idx < data.opponentPieces!.length) {
               const sp = data.opponentPieces![idx];
               return { ...p, id: sp.id, position: { row: sp.row, col: sp.col } };
@@ -297,20 +303,22 @@ export default function GameBoard() {
     }) as never);
 
     s.on('opponentPieces' as never, ((data: { pieces: { id: string; row: number; col: number }[] }) => {
-      // Place opponent pieces on the board (positions only, no ranks revealed)
+      // Place opponent pieces on the board using ID-based mapping
       setGameState(prev => {
         const mySide = playerSideRef.current;
         const opponentOwner = mySide === Player.White ? Player.Black : Player.White;
-        const opponentPieces = prev.pieces.filter(p => p.owner === opponentOwner);
-
-        // Primary: index-based mapping (both clients create pieces in same PIECE_COUNTS order)
-        // Also assign server IDs so moveMade can find them later
+        const serverMap = new Map(data.pieces.map(sp => [sp.id, sp]));
+        const oppLocal = prev.pieces.filter(p => p.owner === opponentOwner);
         const updatedPieces = prev.pieces.map(p => {
           if (p.owner !== opponentOwner) return p;
-          const idx = opponentPieces.indexOf(p);
+          // ID match
+          const byId = serverMap.get(p.id);
+          if (byId) return { ...p, id: byId.id, position: { row: byId.row, col: byId.col } };
+          // Fallback: index
+          const idx = oppLocal.indexOf(p);
           if (idx >= 0 && idx < data.pieces.length) {
-            const serverPiece = data.pieces[idx];
-            return { ...p, id: serverPiece.id, position: { row: serverPiece.row, col: serverPiece.col } };
+            const sp = data.pieces[idx];
+            return { ...p, id: sp.id, position: { row: sp.row, col: sp.col } };
           }
           return p;
         });
@@ -330,8 +338,10 @@ export default function GameBoard() {
     }) as never);
 
     s.on('timerUpdate' as never, ((data: { white: number; black: number }) => {
-      setOnlineTimerWhite(data.white);
-      setOnlineTimerBlack(data.black);
+      // Server may still send these; cap to prevent ms-as-seconds bugs
+      const maxSec = TIMER_SECONDS[onlineTimerMode] || 120;
+      setOnlineTimerWhite(Math.min(data.white, maxSec));
+      setOnlineTimerBlack(Math.min(data.black, maxSec));
     }) as never);
 
     s.on('moveMade' as never, ((data: { pieceId: string; fromRow: number; fromCol: number; toRow: number; toCol: number; challenge?: { result: string; eliminatedPieceIds: string[] }; currentPlayer: 'white' | 'black'; turnCount: number; timerWhite: number; timerBlack: number }) => {
@@ -345,8 +355,10 @@ export default function GameBoard() {
       } else {
         sounds?.move();
       }
-      setOnlineTimerWhite(data.timerWhite);
-      setOnlineTimerBlack(data.timerBlack);
+      // Cap timer values to prevent ms-as-seconds bugs
+      const maxSec = TIMER_SECONDS[onlineTimerMode] || 120;
+      setOnlineTimerWhite(Math.min(data.timerWhite, maxSec));
+      setOnlineTimerBlack(Math.min(data.timerBlack, maxSec));
       setGameState(prev => {
         let pieces = [...prev.pieces];
         const movingPiece = pieces.find(p => p.id === data.pieceId);
@@ -422,29 +434,30 @@ export default function GameBoard() {
       setOpponentName(data.opponent);
       setOpponentElo(data.opponentElo);
       setOnlineTimerMode(data.timerMode);
-      setOnlineTimerWhite(data.timerWhite);
-      setOnlineTimerBlack(data.timerBlack);
+      const maxSec = TIMER_SECONDS[data.timerMode] || 120;
+      setOnlineTimerWhite(Math.min(data.timerWhite, maxSec));
+      setOnlineTimerBlack(Math.min(data.timerBlack, maxSec));
       setMode('online');
       if (queueInterval.current) { clearInterval(queueInterval.current); queueInterval.current = null; }
 
-      // Rebuild full game state from server data
+      // Rebuild full game state from server data using ID-based mapping
       setGameState(prev => {
+        const myPieceMap = new Map(data.myPieces.map(sp => [sp.id, sp]));
+        const oppPieceMap = new Map(data.opponentPieces.map(sp => [sp.id, sp]));
+        const opponentOwner = nextSide === Player.White ? Player.Black : Player.White;
+        const oppLocal = prev.pieces.filter(p => p.owner === opponentOwner);
+
         const pieces = prev.pieces.map(p => {
           if (p.owner === nextSide) {
-            // My pieces — match by rank and assign server positions
-            const match = data.myPieces.find(sp => sp.id === p.id) ||
-              data.myPieces.find(sp => sp.rank === (p.rank as string) && !prev.pieces.some(
-                existing => existing.id === sp.id && existing !== p
-              ));
-            if (match) {
-              return { ...p, id: match.id, position: { row: match.row, col: match.col }, isEliminated: false };
-            }
+            // My pieces — match by ID first, then by rank
+            const byId = myPieceMap.get(p.id);
+            if (byId) return { ...p, id: byId.id, position: { row: byId.row, col: byId.col }, isEliminated: false };
             return { ...p, position: null, isEliminated: true };
           } else {
-            // Opponent pieces — positions only
-            const opponentOwner = nextSide === Player.White ? Player.Black : Player.White;
-            const oppPiecesList = prev.pieces.filter(pp => pp.owner === opponentOwner);
-            const idx = oppPiecesList.indexOf(p);
+            // Opponent pieces — ID match, then index fallback
+            const byId = oppPieceMap.get(p.id);
+            if (byId) return { ...p, id: byId.id, position: { row: byId.row, col: byId.col }, isEliminated: false };
+            const idx = oppLocal.indexOf(p);
             if (idx >= 0 && idx < data.opponentPieces.length) {
               const sp = data.opponentPieces[idx];
               return { ...p, id: sp.id, position: { row: sp.row, col: sp.col }, isEliminated: false };
@@ -456,7 +469,7 @@ export default function GameBoard() {
         return { ...prev, pieces, phase, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, turnCount: data.turnCount };
       });
     }) as never);
-  }, [user, getIdToken, sounds]);
+  }, [user, getIdToken, sounds, onlineTimerMode]);
 
   // ── Client-side timer countdown (smooth local updates between server pushes) ──
   useEffect(() => {
