@@ -95,32 +95,53 @@ function normalizeTimerSeconds(value: number | undefined, mode: TimerMode): numb
   return Math.max(0, Math.min(normalized, max));
 }
 
-function applyPiecePositions(
+function applyMyPiecePositions(
   pieces: Piece[],
   owner: Player,
-  serverPieces: { id: string; row: number; col: number }[],
-  markMissingEliminated: boolean,
+  serverPieces: { id: string; row: number; col: number; rank?: string }[],
 ): Piece[] {
   const byId = new Map(serverPieces.map((sp) => [sp.id, sp]));
-  const localOwnerPieces = pieces.filter((p) => p.owner === owner);
-  const localOwnerIndex = new Map(localOwnerPieces.map((p, idx) => [p.id, idx]));
-
   return pieces.map((p) => {
     if (p.owner !== owner) return p;
-
-    const idMatch = byId.get(p.id);
-    if (idMatch) {
-      return { ...p, id: idMatch.id, position: { row: idMatch.row, col: idMatch.col }, isEliminated: false };
+    const match = byId.get(p.id);
+    if (match) {
+      return { ...p, position: { row: match.row, col: match.col }, isEliminated: false };
     }
-
-    const idx = localOwnerIndex.get(p.id);
-    if (idx != null && idx >= 0 && idx < serverPieces.length) {
-      const fallback = serverPieces[idx];
-      return { ...p, id: fallback.id, position: { row: fallback.row, col: fallback.col }, isEliminated: false };
-    }
-
-    return markMissingEliminated ? { ...p, position: null, isEliminated: true } : p;
+    // Piece not in server data → eliminated
+    return { ...p, position: null, isEliminated: true };
   });
+}
+
+/** Replace opponent piece array from authoritative server data.
+ *  Constructs pieces directly — no ID matching required. */
+function replaceOpponentPieces(
+  pieces: Piece[],
+  opponentOwner: Player,
+  serverPieces: { id: string; row: number; col: number }[],
+): Piece[] {
+  const nonOpponent = pieces.filter((p) => p.owner !== opponentOwner);
+
+  // Build active opponent pieces from server data
+  const serverIdSet = new Set(serverPieces.map((sp) => sp.id));
+  const existingById = new Map(pieces.filter((p) => p.owner === opponentOwner).map((p) => [p.id, p]));
+
+  const activeOpponents: Piece[] = serverPieces.map((sp) => {
+    const existing = existingById.get(sp.id);
+    return {
+      id: sp.id,
+      rank: existing?.rank ?? Rank.Private,
+      owner: opponentOwner,
+      position: { row: sp.row, col: sp.col },
+      isEliminated: false,
+    };
+  });
+
+  // Keep eliminated opponent pieces (not in active server list)
+  const eliminatedOpponents = pieces.filter(
+    (p) => p.owner === opponentOwner && p.isEliminated && !serverIdSet.has(p.id),
+  );
+
+  return [...nonOpponent, ...activeOpponents, ...eliminatedOpponents];
 }
 
 export default function GameBoard() {
@@ -304,7 +325,7 @@ export default function GameBoard() {
     s.on('autoDeployed' as never, ((data: { pieces: { id: string; rank: string; row: number; col: number }[] }) => {
       setGameState(prev => {
         const mySide = playerSideRef.current;
-        const updatedPieces = applyPiecePositions(prev.pieces, mySide, data.pieces, false);
+        const updatedPieces = applyMyPiecePositions(prev.pieces, mySide, data.pieces);
         return { ...prev, pieces: updatedPieces };
       });
     }) as never);
@@ -319,7 +340,7 @@ export default function GameBoard() {
         if (data.opponentPieces && data.opponentPieces.length > 0) {
           const mySide = playerSideRef.current;
           const opponentOwner = mySide === Player.White ? Player.Black : Player.White;
-          pieces = applyPiecePositions(prev.pieces, opponentOwner, data.opponentPieces, false);
+          pieces = replaceOpponentPieces(prev.pieces, opponentOwner, data.opponentPieces);
         }
         return { ...prev, pieces, phase: GamePhase.Playing, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black };
       });
@@ -333,7 +354,7 @@ export default function GameBoard() {
       setGameState(prev => {
         const mySide = playerSideRef.current;
         const opponentOwner = mySide === Player.White ? Player.Black : Player.White;
-        const updatedPieces = applyPiecePositions(prev.pieces, opponentOwner, data.pieces, false);
+        const updatedPieces = replaceOpponentPieces(prev.pieces, opponentOwner, data.pieces);
         return { ...prev, pieces: updatedPieces };
       });
     }) as never);
@@ -452,8 +473,8 @@ export default function GameBoard() {
 
       setGameState(prev => {
         const opponentOwner = nextSide === Player.White ? Player.Black : Player.White;
-        let pieces = applyPiecePositions(prev.pieces, nextSide, data.myPieces, true);
-        pieces = applyPiecePositions(pieces, opponentOwner, data.opponentPieces, true);
+        let pieces = applyMyPiecePositions(prev.pieces, nextSide, data.myPieces);
+        pieces = replaceOpponentPieces(pieces, opponentOwner, data.opponentPieces);
         const phase = data.phase === 'playing' ? GamePhase.Playing : data.phase === 'setup' ? GamePhase.Setup : GamePhase.GameOver;
         return { ...prev, pieces, phase, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, turnCount: data.turnCount };
       });
