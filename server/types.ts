@@ -109,6 +109,7 @@ export interface ClientToServerEvents {
   joinAsArbiter: (data: { roomId: string }) => void;
   submitSetup: (data: { pieces: SerializedPiece[] }) => void;
   makeMove: (data: { pieceId: string; toRow: number; toCol: number }) => void;
+  requestFullGameState: () => void;
   requestRematch: () => void;
   resign: () => void;
   getReplay: (data: { replayId: string }) => void;

@@ -144,6 +144,58 @@ function replaceOpponentPieces(
   return [...nonOpponent, ...activeOpponents, ...eliminatedOpponents];
 }
 
+function buildOnlinePiecesFromFullState(
+  side: Player,
+  myPieces: { id: string; rank: string; row: number; col: number }[],
+  opponentPieces: { id: string; row: number; col: number }[],
+  previousPieces: Piece[],
+): Piece[] {
+  const basePieces = createInitialGameState().pieces;
+  const opponentOwner = side === Player.White ? Player.Black : Player.White;
+
+  const myById = new Map(myPieces.map((p) => [p.id, p]));
+  const previousOpponentById = new Map(
+    previousPieces.filter((p) => p.owner === opponentOwner).map((p) => [p.id, p]),
+  );
+  const baseOpponentById = new Map(
+    basePieces.filter((p) => p.owner === opponentOwner).map((p) => [p.id, p.rank]),
+  );
+
+  const hydratedMine: Piece[] = basePieces
+    .filter((p) => p.owner === side)
+    .map((p) => {
+      const match = myById.get(p.id);
+      if (!match) {
+        return { ...p, position: null, isEliminated: true };
+      }
+      return {
+        ...p,
+        rank: match.rank as Rank,
+        position: { row: match.row, col: match.col },
+        isEliminated: false,
+      };
+    });
+
+  const hydratedOpponents: Piece[] = opponentPieces.map((p) => {
+    const previous = previousOpponentById.get(p.id);
+    const baseRank = baseOpponentById.get(p.id);
+    return {
+      id: p.id,
+      rank: previous?.rank ?? baseRank ?? Rank.Private,
+      owner: opponentOwner,
+      position: { row: p.row, col: p.col },
+      isEliminated: false,
+    };
+  });
+
+  const activeOpponentIds = new Set(opponentPieces.map((p) => p.id));
+  const eliminatedOpponents = previousPieces.filter(
+    (p) => p.owner === opponentOwner && p.isEliminated && !activeOpponentIds.has(p.id),
+  );
+
+  return [...hydratedMine, ...hydratedOpponents, ...eliminatedOpponents];
+}
+
 export default function GameBoard() {
   const { user, profile, getIdToken } = useAuth();
   const [mode, setMode] = useState<GameMode>('menu');
@@ -344,6 +396,8 @@ export default function GameBoard() {
         }
         return { ...prev, pieces, phase: GamePhase.Playing, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black };
       });
+      // Ask for canonical snapshot right after start to eliminate startup desync.
+      s.emit('requestFullGameState' as never);
     }) as never);
 
     s.on('opponentReady' as never, (() => {
@@ -393,7 +447,10 @@ export default function GameBoard() {
       setGameState(prev => {
         let pieces = [...prev.pieces];
         const movingPiece = pieces.find(p => p.id === data.pieceId);
-        if (!movingPiece) return prev;
+        if (!movingPiece) {
+          s.emit('requestFullGameState' as never);
+          return prev;
+        }
         if (data.challenge) {
           const result = data.challenge.result;
           if (result === 'attacker_wins' || result === 'flag_captured') {
@@ -472,9 +529,7 @@ export default function GameBoard() {
       if (queueInterval.current) { clearInterval(queueInterval.current); queueInterval.current = null; }
 
       setGameState(prev => {
-        const opponentOwner = nextSide === Player.White ? Player.Black : Player.White;
-        let pieces = applyMyPiecePositions(prev.pieces, nextSide, data.myPieces);
-        pieces = replaceOpponentPieces(pieces, opponentOwner, data.opponentPieces);
+        const pieces = buildOnlinePiecesFromFullState(nextSide, data.myPieces, data.opponentPieces, prev.pieces);
         const phase = data.phase === 'playing' ? GamePhase.Playing : data.phase === 'setup' ? GamePhase.Setup : GamePhase.GameOver;
         return { ...prev, pieces, phase, currentPlayer: data.currentPlayer === 'white' ? Player.White : Player.Black, turnCount: data.turnCount };
       });
@@ -494,6 +549,25 @@ export default function GameBoard() {
     }, 1000);
     return () => clearInterval(interval);
   }, [mode, gameState.phase, gameState.currentPlayer, onlineTimerMode]);
+
+  // If opponent pieces are unexpectedly missing in play phase, request an authoritative resync.
+  useEffect(() => {
+    if (mode !== 'online' || gameState.phase !== GamePhase.Playing) return;
+
+    const opponentOwner = playerSide === Player.White ? Player.Black : Player.White;
+    const visibleOpponentCount = gameState.pieces.filter(
+      (p) => p.owner === opponentOwner && p.position && !p.isEliminated,
+    ).length;
+
+    if (visibleOpponentCount > 0) return;
+
+    const t = setTimeout(() => {
+      const s = connectSocket();
+      s.emit('requestFullGameState' as never);
+    }, 250);
+
+    return () => clearTimeout(t);
+  }, [mode, gameState.phase, gameState.pieces, playerSide]);
 
   // ── Queue timer counter ──
   useEffect(() => {

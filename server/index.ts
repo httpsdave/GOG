@@ -220,7 +220,7 @@ function startSetupTimer(room: RoomState): void {
         timerBlack: timers.black,
       });
     }
-    emitFullGameStateToPlayers(room);
+    emitFullGameStateBurst(room);
   }, SETUP_DURATION);
 }
 
@@ -319,6 +319,17 @@ function emitFullGameState(room: RoomState, color: 'white' | 'black'): void {
 function emitFullGameStateToPlayers(room: RoomState): void {
   emitFullGameState(room, 'white');
   emitFullGameState(room, 'black');
+}
+
+function emitFullGameStateBurst(room: RoomState): void {
+  emitFullGameStateToPlayers(room);
+  // Follow up with a short delayed sync to avoid startup desync.
+  setTimeout(() => {
+    const latest = rooms.get(room.roomId);
+    if (!latest || latest !== room) return;
+    if (latest.phase !== 'setup' && latest.phase !== 'playing') return;
+    emitFullGameStateToPlayers(latest);
+  }, 150);
 }
 
 // ─── Firestore helpers ───
@@ -822,8 +833,22 @@ io.on('connection', (socket) => {
           timerBlack: timers.black,
         });
       }
-      emitFullGameStateToPlayers(room);
+      emitFullGameStateBurst(room);
     }
+  });
+
+  socket.on('requestFullGameState', () => {
+    const roomId = socketToRoom.get(socket.id);
+    if (!roomId) return;
+
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const isWhite = room.white?.socketId === socket.id;
+    const isBlack = room.black?.socketId === socket.id;
+    if (!isWhite && !isBlack) return;
+
+    emitFullGameState(room, isWhite ? 'white' : 'black');
   });
 
   socket.on('makeMove', ({ pieceId, toRow, toCol }) => {
