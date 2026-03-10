@@ -174,6 +174,7 @@ function startSetupTimer(room: RoomState): void {
     clearSetupTimer(room);
     room.phase = 'playing';
     room.currentPlayer = 'white';
+    startTurnTimer(room);
 
     // Send opponent piece positions to each player
     const whiteSocket = room.white?.socketId ? io.sockets.sockets.get(room.white.socketId) : null;
@@ -219,7 +220,7 @@ function startSetupTimer(room: RoomState): void {
         timerBlack: timers.black,
       });
     }
-    startTurnTimer(room);
+    emitFullGameStateToPlayers(room);
   }, SETUP_DURATION);
 }
 
@@ -274,6 +275,50 @@ function getRemainingTime(room: RoomState): { white: number; black: number } {
 function getTimerSeconds(room: RoomState): { white: number; black: number } {
   const ms = getRemainingTime(room);
   return { white: Math.ceil(ms.white / 1000), black: Math.ceil(ms.black / 1000) };
+}
+
+function buildFullGameState(room: RoomState, color: 'white' | 'black') {
+  const isWhite = color === 'white';
+  const me = isWhite ? room.white : room.black;
+  if (!me) return null;
+
+  const opponent = isWhite ? room.black : room.white;
+  const myPieces = isWhite ? room.whitePieces : room.blackPieces;
+  const oppPieces = isWhite ? room.blackPieces : room.whitePieces;
+  const timers = getTimerSeconds(room);
+
+  return {
+    phase: room.phase === 'waiting' ? 'setup' : room.phase,
+    color,
+    opponent: opponent?.username || 'Unknown',
+    opponentElo: opponent?.elo || 1200,
+    opponentPieces: oppPieces
+      .filter(p => !p.isEliminated && p.row != null && p.col != null)
+      .map(p => ({ id: p.id, row: p.row!, col: p.col! })),
+    myPieces: myPieces
+      .filter(p => !p.isEliminated && p.row != null && p.col != null)
+      .map(p => ({ id: p.id, rank: p.rank, row: p.row!, col: p.col! })),
+    currentPlayer: room.currentPlayer,
+    timerMode: room.timerMode,
+    timerWhite: timers.white,
+    timerBlack: timers.black,
+    turnCount: room.turnCount,
+  };
+}
+
+function emitFullGameState(room: RoomState, color: 'white' | 'black'): void {
+  const payload = buildFullGameState(room, color);
+  if (!payload) return;
+
+  const socketId = color === 'white' ? room.white?.socketId : room.black?.socketId;
+  if (!socketId) return;
+
+  io.sockets.sockets.get(socketId)?.emit('fullGameState', payload);
+}
+
+function emitFullGameStateToPlayers(room: RoomState): void {
+  emitFullGameState(room, 'white');
+  emitFullGameState(room, 'black');
 }
 
 // ─── Firestore helpers ───
@@ -499,26 +544,10 @@ io.on('connection', (socket) => {
         socketToRoom.delete(oldSocketId);
         socket.join(roomId);
 
-        const opponent = isWhite ? room.black : room.white;
-        const myPieces = isWhite ? room.whitePieces : room.blackPieces;
-        const oppPieces = isWhite ? room.blackPieces : room.whitePieces;
-        const timers = getTimerSeconds(room);
-
-        socket.emit('fullGameState', {
-          phase: room.phase,
-          color,
-          opponent: opponent?.username || 'Unknown',
-          opponentElo: opponent?.elo || 1200,
-          opponentPieces: oppPieces.filter(p => !p.isEliminated && p.row != null && p.col != null).map(p => ({ id: p.id, row: p.row!, col: p.col! })),
-          myPieces: myPieces.filter(p => !p.isEliminated && p.row != null && p.col != null).map(p => ({ id: p.id, rank: p.rank, row: p.row!, col: p.col! })),
-          currentPlayer: room.currentPlayer,
-          timerMode: room.timerMode,
-          timerWhite: timers.white,
-          timerBlack: timers.black,
-          turnCount: room.turnCount,
-        });
+        emitFullGameState(room, color);
 
         // Notify opponent
+        const opponent = isWhite ? room.black : room.white;
         if (opponent?.socketId) {
           io.sockets.sockets.get(opponent.socketId)?.emit('opponentReconnected');
         }
@@ -755,6 +784,7 @@ io.on('connection', (socket) => {
       clearSetupTimer(room);
       room.phase = 'playing';
       room.currentPlayer = 'white';
+      startTurnTimer(room);
 
       // Send opponent piece positions (without ranks) to each player
       const whiteSocket = room.white?.socketId ? io.sockets.sockets.get(room.white.socketId) : null;
@@ -792,7 +822,7 @@ io.on('connection', (socket) => {
           timerBlack: timers.black,
         });
       }
-      startTurnTimer(room);
+      emitFullGameStateToPlayers(room);
     }
   });
 
@@ -943,6 +973,7 @@ io.on('connection', (socket) => {
 
     if (room.white?.socketId) io.sockets.sockets.get(room.white.socketId)?.emit('moveMade', moveEvent);
     if (room.black?.socketId) io.sockets.sockets.get(room.black.socketId)?.emit('moveMade', moveEvent);
+    emitFullGameStateToPlayers(room);
 
     // Arbiter gets full info
     if (room.arbiter) {
